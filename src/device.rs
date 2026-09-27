@@ -32,10 +32,31 @@ const PACKET_SIZE: usize = 1024;
 const HEADER: [u8; 2] = [0x7c, 0x7c];
 const USAGE_PAGE: u16 = 0x000c;
 // All three hardware variants use the same HID VID/PID and the same 5x3
-// image bundle protocol.  The original D200 has 14 physical LCD keys (the
-// last grid cell is a harmless ghost cell), while the D200X exposes all 15.
-// Keeping the complete grid here lets one plugin work with both families.
+// image bundle protocol.
+//
+// Grid slots (OpenDeck keypad position == hardware screen index):
+//   0..=12  the single LCD keys
+//   13      the double-width ("wide") screen, the one the status window
+//           command (OutSetSmallWindowData) drives
+//   14      phantom: the right half of slot 13, never addressable
+//
+// The D200/D200H have 14 physical keys, so slot 14 is a ghost cell there.
 pub const NUM_BUTTONS: usize = 15;
+/// Slot holding the double-width status screen.
+pub const WIDE_KEY: usize = 13;
+/// Right half of the wide screen: not addressable, left out of the bundle.
+pub const PHANTOM_KEY: usize = 14;
+/// Native icon resolution of a single screen.
+pub const ICON_SIZE: u32 = 196;
+/// The firmware squeezes a wide icon from 392 -> 196, so compose it on a 2:1
+/// canvas of this width.
+pub const WIDE_ICON_WIDTH: u32 = 392;
+/// Hardware input indexes reporting the three rotary encoders (0, 1, 2).
+pub const DIAL_BASE: usize = 17;
+pub const NUM_ENCODERS: usize = 3;
+/// D200X side buttons are reported inside the same index space as the dials.
+pub const SIDE_BUTTON_BASE: usize = DIAL_BASE + NUM_ENCODERS;
+const MAX_INPUT_INDEX: usize = 19;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
 
@@ -66,6 +87,21 @@ pub struct ButtonEvent {
     pub index: usize,
     pub pressed: bool,
     pub state: u8,
+}
+
+/// The D200X multiplexes its dials and side buttons into the same report
+/// stream as the LCD keys. The state byte disambiguates them: 2 means a dial
+/// turn, while a plain press/release carries 0 or 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    /// An LCD key (0..=12, or 13/14 on the wide screen).
+    Key { index: usize, pressed: bool },
+    /// A rotary encoder: `position` 0..2, `ticks` -1 for left, +1 for right.
+    Encoder { position: u8, ticks: i16 },
+    /// An encoder push.
+    EncoderPress { position: u8, pressed: bool },
+    /// A side button (no display of its own).
+    SideButton { index: usize, pressed: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +169,19 @@ fn resize_square(img: &DynamicImage, size: u32) -> DynamicImage {
     }
 }
 
+/// Render the D200X wide key without stretching its source before the
+/// firmware's own 2:1 display conversion.
+fn resize_wide(img: &DynamicImage) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    let scale = (WIDE_ICON_WIDTH as f64 / w as f64).min(ICON_SIZE as f64 / h as f64);
+    let nw = (w as f64 * scale).round() as u32;
+    let nh = (h as f64 * scale).round() as u32;
+    let resized = img.resize(nw, nh, image::imageops::FilterType::Triangle).to_rgb8();
+    let mut canvas = RgbImage::from_pixel(WIDE_ICON_WIDTH, ICON_SIZE, image::Rgb([0, 0, 0]));
+    image::imageops::overlay(&mut canvas, &resized, ((WIDE_ICON_WIDTH - nw) / 2) as i64, ((ICON_SIZE - nh) / 2) as i64);
+    DynamicImage::ImageRgb8(canvas)
+}
+
 impl UlanziDevice {
     // -- Construction -------------------------------------------------------
 
@@ -148,6 +197,11 @@ impl UlanziDevice {
                     && d.usage_page == USAGE_PAGE
             })
             .ok_or_else(|| anyhow!("Ulanzi D200 device not found"))?;
+
+        // The HID identifiers are shared by the D200/H and D200X. The richer
+        // report indexes identify the D200X, but until a first report arrives
+        // accept grid writes for the family and consistently emit the wide
+        // aspect image; on older models only the screen's fixed aspect differs.
 
         let (reader, writer) = device_info.open().await?;
 
@@ -198,7 +252,7 @@ impl UlanziDevice {
         }
 
         let index = buf[9] as usize;
-        if index >= NUM_BUTTONS {
+        if index > MAX_INPUT_INDEX {
             warn!("Received button event with out-of-range index {}", index);
             return None;
         }
@@ -208,6 +262,29 @@ impl UlanziDevice {
             index,
             pressed: buf[11] == 0x01,
         })
+    }
+
+    pub fn parse_input(buf: &[u8]) -> Option<InputEvent> {
+        let raw = Self::parse_report(buf)?;
+        let is_dial = (DIAL_BASE..DIAL_BASE + NUM_ENCODERS).contains(&raw.index)
+            || raw.state == 2;
+        let is_side = (SIDE_BUTTON_BASE..=MAX_INPUT_INDEX).contains(&raw.index);
+
+        if is_dial && raw.index < SIDE_BUTTON_BASE {
+            let position = (raw.index - DIAL_BASE) as u8;
+            if raw.state == 2 {
+                let ticks = if buf[11] == 3 { 1 } else { -1 };
+                return Some(InputEvent::Encoder { position, ticks });
+            }
+            return Some(InputEvent::EncoderPress { position, pressed: raw.pressed });
+        }
+        if is_side {
+            return Some(InputEvent::SideButton { index: raw.index, pressed: raw.pressed });
+        }
+        if raw.index == PHANTOM_KEY {
+            return None;
+        }
+        Some(InputEvent::Key { index: raw.index, pressed: raw.pressed })
     }
 
     // -- High‑level commands ------------------------------------------------
@@ -255,6 +332,9 @@ impl UlanziDevice {
                 NUM_BUTTONS - 1
             ));
         }
+        if index == PHANTOM_KEY {
+            return Err(anyhow!("Button index {} is the phantom half of the wide screen", index));
+        }
 
         let png_data = if image_data.starts_with("data:") {
             // Data URL (Base64)
@@ -263,7 +343,7 @@ impl UlanziDevice {
                 .decode_to_vec()
                 .map_err(|_| anyhow!("Failed to decode data URL"))?;
             let img = image::load_from_memory(&body)?;
-            let resized = resize_square(&img, 196);
+            let resized = if index == WIDE_KEY { resize_wide(&img) } else { resize_square(&img, ICON_SIZE) };
             let mut buf = Vec::new();
             {
                 let mut cursor = Cursor::new(&mut buf);
@@ -278,7 +358,7 @@ impl UlanziDevice {
             }
             let img = image::open(path)
                 .map_err(|e| anyhow!("Failed to open image {}: {}", image_data, e))?;
-            let resized = resize_square(&img, 196);
+            let resized = if index == WIDE_KEY { resize_wide(&img) } else { resize_square(&img, ICON_SIZE) };
             let mut buf = Vec::new();
             {
                 let mut cursor = Cursor::new(&mut buf);
@@ -361,6 +441,9 @@ impl UlanziDevice {
                 let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
                 numbers.shuffle(&mut rngs::ThreadRng::default());
                 for (index, value) in numbers.into_iter().enumerate() {
+                    if value == PHANTOM_KEY {
+                        continue;
+                    }
                     let col = value % 5;
                     let row = value / 5;
                     let key = format!("{}_{}", col, row);

@@ -11,7 +11,7 @@ use crate::config::WINDOW_MODE_STATUS;
 use crate::config::WINDOW_MODE_CLOCK;
 use crate::config::WINDOW_MODE_CLEAR;
 use crate::config::Config;
-use crate::device::{ButtonEvent, UlanziDevice};
+use crate::device::{InputEvent, UlanziDevice};
 use crate::openaction_client::BridgeEvent;
 use crate::system_monitor::SystemMonitor;
 
@@ -19,6 +19,9 @@ use crate::system_monitor::SystemMonitor;
 pub enum HardwareEvent {
     KeyDown { device_id: String, key_index: u8 },
     KeyUp { device_id: String, key_index: u8 },
+    EncoderRotate { device_id: String, position: u8, ticks: i16 },
+    EncoderDown { device_id: String, position: u8 },
+    EncoderUp { device_id: String, position: u8 },
     DeviceConnected { device_id: String },
 }
 
@@ -31,8 +34,8 @@ pub struct UlanziDaemon {
     gpu_usage: u8,
     plugin_cmd_rx: Option<mpsc::Receiver<BridgeEvent>>,
     hw_event_tx: Option<mpsc::Sender<HardwareEvent>>,
-    device_input_rx: mpsc::Receiver<(String, ButtonEvent)>,
-    device_input_tx: mpsc::Sender<(String, ButtonEvent)>,
+    device_input_rx: mpsc::Receiver<(String, InputEvent)>,
+    device_input_tx: mpsc::Sender<(String, InputEvent)>,
     // Debouncing & rate limiting
     flush_deadline: Option<Instant>,
     last_flush_time: Option<Instant>,
@@ -125,7 +128,7 @@ impl UlanziDaemon {
                     loop {
                         match reader.read_input_report(&mut buf).await {
                             Ok(len) if len > 0 => {
-                                if let Some(event) = UlanziDevice::parse_report(&buf[..len]) {
+                                if let Some(event) = UlanziDevice::parse_input(&buf[..len]) {
                                     if tx.send((device_id.clone(), event)).await.is_err() {
                                         break;
                                     }
@@ -313,8 +316,24 @@ impl UlanziDaemon {
         }
     }
 
-    async fn handle_device_event(&mut self, device_id: &str, event: ButtonEvent) {
+    async fn handle_device_event(&mut self, device_id: &str, event: InputEvent) {
         debug!("Button event from {}: {:?}", device_id, event);
+        let Some(tx) = &self.hw_event_tx else { return };
+        let event = match event {
+            InputEvent::Key { index, pressed } => if pressed {
+                HardwareEvent::KeyDown { device_id: device_id.to_string(), key_index: index as u8 }
+            } else { HardwareEvent::KeyUp { device_id: device_id.to_string(), key_index: index as u8 } },
+            InputEvent::Encoder { position, ticks } => HardwareEvent::EncoderRotate { device_id: device_id.to_string(), position, ticks },
+            InputEvent::EncoderPress { position, pressed } => if pressed {
+                HardwareEvent::EncoderDown { device_id: device_id.to_string(), position }
+            } else { HardwareEvent::EncoderUp { device_id: device_id.to_string(), position } },
+            InputEvent::SideButton { index, pressed } => if pressed {
+                HardwareEvent::KeyDown { device_id: device_id.to_string(), key_index: index as u8 }
+            } else { HardwareEvent::KeyUp { device_id: device_id.to_string(), key_index: index as u8 } },
+        };
+        let _ = tx.send(event).await;
+        return;
+        /*
         if let Some(ref tx) = self.hw_event_tx {
             let outbound = if event.pressed {
                 HardwareEvent::KeyDown {
@@ -331,6 +350,7 @@ impl UlanziDaemon {
                 warn!("Failed to broadcast hardware event: {}", e);
             }
         }
+        */
     }
 
     async fn handle_plugin_command(&mut self, cmd: BridgeEvent) {
@@ -446,6 +466,7 @@ impl UlanziDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::ButtonEvent;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -479,7 +500,7 @@ mod tests {
             pressed: true,
             state: 1,
         };
-        daemon.handle_device_event("test_device", event).await;
+        daemon.handle_device_event("test_device", InputEvent::Key { index: event.index, pressed: event.pressed }).await;
 
         let received = hw_event_rx.recv().await.unwrap();
         match received {
@@ -522,7 +543,7 @@ mod tests {
             pressed: false,
             state: 0,
         };
-        daemon.handle_device_event("test_device", event).await;
+        daemon.handle_device_event("test_device", InputEvent::Key { index: event.index, pressed: event.pressed }).await;
 
         let received = hw_event_rx.recv().await.unwrap();
         match received {

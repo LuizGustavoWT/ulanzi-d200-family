@@ -152,10 +152,19 @@ async fn main() -> Result<()> {
                             "Ulanzi D200 / D200H / D200X".to_string(),
                             3,
                             5,
-                            0,
+                            3,
                             0,
                         )
                         .await;
+                    }
+                    daemon::HardwareEvent::EncoderRotate { device_id, position, ticks } => {
+                        let _ = openaction::device_plugin::encoder_change(device_id, position, ticks).await;
+                    }
+                    daemon::HardwareEvent::EncoderDown { device_id, position } => {
+                        let _ = openaction::device_plugin::encoder_down(device_id, position).await;
+                    }
+                    daemon::HardwareEvent::EncoderUp { device_id, position } => {
+                        let _ = openaction::device_plugin::encoder_up(device_id, position).await;
                     }
                 }
             }
