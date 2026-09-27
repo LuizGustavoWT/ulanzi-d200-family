@@ -1,8 +1,8 @@
 ![OpenDeck Ulanzi D200 Driver Logo](src/assets/icon.png)
 
-# OpenDeck Ulanzi D200 Driver (Unofficial)
+# OpenDeck Ulanzi D200 Family Driver (Unofficial)
 
-An unofficial plugin for [OpenDeck](https://github.com/nekename/OpenDeck) that adds support for the Ulanzi D200 and D200H devices.
+An unofficial unified plugin for [OpenDeck](https://github.com/nekename/OpenDeck) that adds support for the Ulanzi D200, D200H and D200X devices. Install only this plugin; it manages all three variants.
 
 > **Note**: This project is mirrored on GitHub for visibility, but the official source is on [GitLab](https://gitlab.com/glmagalhaes.mail/rs-ulanzi-d-200-linux). Please open issues there.
 >
@@ -14,8 +14,9 @@ An unofficial plugin for [OpenDeck](https://github.com/nekename/OpenDeck) that a
 
 - Ulanzi D200 (USB ID `2207:0019`)
 - Ulanzi D200H (USB ID `2207:0019`)
+- Ulanzi D200X (USB ID `2207:0019`)
 
-The D200H is identical to the D200 but includes two additional USB hubs (Genesys Logic, Inc., `05e3:0610`).
+The D200H is identical to the D200 but includes two additional USB hubs (Genesys Logic, Inc., `05e3:0610`). The D200X shares the same HID protocol and USB identifier, and exposes the full 5×3 grid (15 slots); the D200/D200H expose 14 physical LCD keys and ignore the final ghost slot.
 
 ---
 
@@ -42,6 +43,12 @@ If you would like to help port the plugin to another platform, feel free to cont
 ---
 
 ## Actions
+
+The plugin uses the same HID protocol for every variant, so a single install
+covers the D200, D200H and D200X — no second download is needed. The D200X
+exposes the full 5x3 keypad (15 slots) while the D200/D200H use 14 of them; the
+rotary encoders and side buttons of the D200X are not yet exposed by the Rust
+bridge.
 
 ### Screen Switch
 
@@ -79,9 +86,9 @@ sh pack.sh release
 
 OpenDeck currently only supports a grid of square buttons (e.g., 5×3). The Ulanzi D200 has a wide button that spans two columns. Because OpenDeck treats every cell as an independent square, the icon assigned to that button appears stretched horizontally.
 
-### Extra empty button
+### Extra empty button on D200/D200H
 
-Since OpenDeck’s grid is always rectangular, the plugin must define a fixed number of rows and columns. On the D200, this creates a “ghost” button in the bottom‑right position (row 3, column 5) that does not exist on the physical device. This button is non‑functional and can be ignored, or you can just store an spare action there ¯\\_(ツ)_/¯.
+Since OpenDeck’s grid is always rectangular, the plugin defines a fixed 5×3 grid. On the D200/D200H, the bottom-right position (row 3, column 5) is a “ghost” button and is non-functional. On the D200X that same position is a real LCD key.
 
 
 ### Wide button not working

@@ -31,7 +31,11 @@ pub const DEVICE_NAMESPACE: &str = "e9";
 const PACKET_SIZE: usize = 1024;
 const HEADER: [u8; 2] = [0x7c, 0x7c];
 const USAGE_PAGE: u16 = 0x000c;
-pub const NUM_BUTTONS: usize = 14;
+// All three hardware variants use the same HID VID/PID and the same 5x3
+// image bundle protocol.  The original D200 has 14 physical LCD keys (the
+// last grid cell is a harmless ghost cell), while the D200X exposes all 15.
+// Keeping the complete grid here lets one plugin work with both families.
+pub const NUM_BUTTONS: usize = 15;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
 

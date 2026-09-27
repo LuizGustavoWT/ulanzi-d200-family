@@ -1,3 +1,9 @@
+# 0.7.0
+* Unified plugin: D200, D200H and D200X are now managed by a single install
+* Image bundle covers the full 5x3 grid (15 slots), which is the full key count on the D200X
+* Updated manifest/readme naming to reflect the whole D200 family
+
+
 # 0.6.5
 * Saving status window state from previous sessions #14
 * Remove remaining code from stand alone daemon

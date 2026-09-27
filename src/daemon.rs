@@ -88,7 +88,8 @@ impl UlanziDaemon {
 
         // --- Initial device setup for all connected devices ---
         for device in self.devices.values_mut() {
-            // 1. Clear the screen (all 14 buttons empty)
+            // 1. Clear the screen (the complete 5x3 grid; D200 ignores its
+            // unused bottom-right cell, D200X uses it).
             if let Err(e) = device.clear_all_images().await {
                 error!("Failed to clear buttons for {}: {}", device.get_id(), e);
             }

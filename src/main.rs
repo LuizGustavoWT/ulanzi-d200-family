@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
                     daemon::HardwareEvent::DeviceConnected { device_id } => {
                         let _ = openaction::device_plugin::register_device(
                             device_id,
-                            "Ulanzi D200".to_string(),
+                            "Ulanzi D200 / D200H / D200X".to_string(),
                             3,
                             5,
                             0,
