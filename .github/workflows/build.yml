@@ -17,7 +17,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
       - name: Build and package
         run: bash pack.sh release
       - name: Upload plugin ZIP
