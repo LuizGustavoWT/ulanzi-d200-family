@@ -411,6 +411,11 @@ impl UlanziDevice {
         };
 
         const INVALID_BYTES: [u8; 2] = [0x00, 0x7c];
+        // The header packet carries the first 1016 bytes of the ZIP, so every
+        // following packet starts at 1016 + n * 1024. The firmware rejects the
+        // bundle if *any* of those packets starts with an invalid byte, so the
+        // whole archive has to be checked, not just its tail.
+        const FIRST_PACKET_BOUNDARY: usize = 1016;
         const MAX_RETRIES: usize = 1000;
 
         let mut dummy_retries = 0;
@@ -475,7 +480,7 @@ impl UlanziDevice {
 
             let file_size = zip_data.len();
             let mut valid = true;
-            for offset in (92152..file_size).step_by(1024) {
+            for offset in (FIRST_PACKET_BOUNDARY..file_size).step_by(PACKET_SIZE) {
                 if let Some(&byte) = zip_data.get(offset) {
                     if INVALID_BYTES.contains(&byte) {
                         debug!(
