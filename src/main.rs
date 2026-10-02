@@ -166,6 +166,9 @@ async fn main() -> Result<()> {
                     daemon::HardwareEvent::EncoderUp { device_id, position } => {
                         let _ = openaction::device_plugin::encoder_up(device_id, position).await;
                     }
+                    daemon::HardwareEvent::DeviceDisconnected { device_id } => {
+                        let _ = openaction::device_plugin::unregister_device(device_id).await;
+                    }
                 }
             }
         });

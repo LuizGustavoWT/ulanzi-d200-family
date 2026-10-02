@@ -1,21 +1,31 @@
-# udev rule for the Ulanzi D200/D200H/D200X Stream Controllers.
-# This rule is specifically for the Ulanzi D200 (Vendor ID: 2207, Product ID: 0019).
+# udev rule for the Ulanzi D200 / D200H / D200X Stream Controllers to allow
+# non-root user access to the hidraw nodes.
+#
+# The three models share the same HID identifiers:
+#   Vendor ID:  0x2207 (Fuzhou Rockchip Electronics Company)
+#   Product ID: 0x0019
+#   Device name: "Zkswe ulanzi"
+#
+# The device exposes two hidraw nodes. Only the one whose usage page is
+# 0x000C (vendor page) carries the button reports; the other (usage 0x0001) is a
+# keyboard/mouse interface. The plugin filters by usage page, so both nodes are
+# opened here.
+#
+# Install:
+#   sudo ./install-udev-rules.sh
+# or:
+#   sudo cp 40-opendeck-ulanzi.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw
+#
+# Then unplug and replug the device (or restart OpenDeck).
 
-# If you are using a different HID device, you will need to discover its
-# Vendor and Product IDs and create a new rule file for it.
-#
-# You can find the IDs for your connected USB devices by running the 'lsusb' command.
-# For example:
-#   $ lsusb
-#   ...
-#   Bus 001 Device 005: ID 2207:0019 Ulanzi
-#   ...
-#
-# The ID is in the format VENDOR_ID:PRODUCT_ID.
-#
-# This library uses the `hidapi` crate, which requires these permissions
-# for non-root users to access the device. For more information, please
-# refer to the hidapi documentation.
+# USB-level tag: gives the whole device access to whoever is logged in at the
+# local seat.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2207", ATTRS{idProduct}=="0019", TAG+="uaccess", MODE="0660"
 
-SUBSYSTEM=="usb", ATTRS{idVendor}=="2207", ATTRS{idProduct}=="0019", TAG+="uaccess"
+# hidraw-level rule: the authoritative one for the plugin. Using
+# ATTRS{idVendor} here resolves through the parent USB device, which is what
+# hidraw nodes expose. The hidraw subsystem rule with ID_VENDOR_ID comes from
+# the usb_device procnode, and hidraw devices do inherit ID_VENDOR_ID.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2207", ATTRS{idProduct}=="0019", TAG+="uaccess", MODE="0660"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_VENDOR_ID}=="2207", ENV{ID_MODEL_ID}=="0019", TAG+="uaccess", MODE="0660"

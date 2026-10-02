@@ -237,6 +237,12 @@ impl UlanziDevice {
         self.reader.take()
     }
 
+    /// True while the device still owns an input reader task. Used by the
+    /// daemon to decide whether a freshly enumerated device needs setup.
+    pub fn has_reader(&self) -> bool {
+        self.reader.is_some()
+    }
+
     // -- Report parsing -----------------------------------------------------
 
     pub fn parse_report(buf: &[u8]) -> Option<ButtonEvent> {

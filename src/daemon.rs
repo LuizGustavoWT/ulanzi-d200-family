@@ -15,6 +15,9 @@ use crate::device::{InputEvent, UlanziDevice};
 use crate::openaction_client::BridgeEvent;
 use crate::system_monitor::SystemMonitor;
 
+/// How often to probe for a newly plugged (or newly accessible) Ulanzi device.
+const DEVICE_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub enum HardwareEvent {
     KeyDown { device_id: String, key_index: u8 },
@@ -23,6 +26,7 @@ pub enum HardwareEvent {
     EncoderDown { device_id: String, position: u8 },
     EncoderUp { device_id: String, position: u8 },
     DeviceConnected { device_id: String },
+    DeviceDisconnected { device_id: String },
 }
 
 pub struct UlanziDaemon {
@@ -86,65 +90,111 @@ impl UlanziDaemon {
         })
     }
 
+    /// Connect to the first available Ulanzi device, if any, and insert it.
+    /// Returns `true` when a new device was added.
+    async fn try_connect(&mut self) -> bool {
+        match UlanziDevice::connect().await {
+            Ok(device) => {
+                let id = device.get_id().to_string();
+                if self.devices.contains_key(&id) {
+                    return false;
+                }
+                self.devices.insert(id, device);
+                info!("Ulanzi device connected");
+                true
+            }
+            Err(e) => {
+                debug!("No Ulanzi device available: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Apply brightness/label style/status window to a device, announce it to
+    /// OpenDeck, and spawn its input reader task.
+    async fn setup_device(&mut self, device_id: &str) {
+        let Some(device) = self.devices.get_mut(device_id) else {
+            return;
+        };
+
+        // 1. Clear the screen (the complete 5x3 grid; D200 ignores its
+        // unused bottom-right cell, D200X uses it).
+        if let Err(e) = device.clear_all_images().await {
+            error!("Failed to clear buttons for {}: {}", device.get_id(), e);
+        }
+
+        // 2. Apply brightness and label style from config
+        if let Err(e) = device.set_brightness(self.config.brightness).await {
+            error!("Failed to set brightness for {}: {}", device.get_id(), e);
+        }
+        if let Ok(label_style) = serde_json::to_value(&self.config.label_style) {
+            let _ = device.set_label_style(&label_style).await;
+        }
+
+        // 3. Start the small-window data with zeros
+        let _ = device
+            .set_small_window_data(self.config.display_mode, 0, 0, "", 0)
+            .await;
+
+        // 4. Notify plugins that a device is connected
+        if let Some(ref tx) = self.hw_event_tx {
+            let _ = tx
+                .send(HardwareEvent::DeviceConnected {
+                    device_id: device.get_id().to_string(),
+                })
+                .await;
+        }
+
+        // 5. Spawn reader task for button events
+        if let Some(mut reader) = device.take_reader() {
+            let tx = self.device_input_tx.clone();
+            let device_id = device.get_id().to_string();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match reader.read_input_report(&mut buf).await {
+                        Ok(len) if len > 0 => {
+                            if let Some(event) = UlanziDevice::parse_input(&buf[..len]) {
+                                if tx.send((device_id.clone(), event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            error!("Device {} read error: {}", device_id, e);
+                            break;
+                        }
+                    }
+                }
+                info!("Reader task finished for {}", device_id);
+            });
+        }
+    }
+
+    /// Remove a device that stopped answering, telling OpenDeck it is gone.
+    async fn drop_device(&mut self, device_id: &str) {
+        if self.devices.remove(device_id).is_none() {
+            return;
+        }
+        warn!("Ulanzi device {} disconnected", device_id);
+        if let Some(ref tx) = self.hw_event_tx {
+            let _ = tx
+                .send(HardwareEvent::DeviceDisconnected {
+                    device_id: device_id.to_string(),
+                })
+                .await;
+        }
+    }
+
     pub async fn run(mut self) -> Result<()> {
         info!("Ulanzi Daemon started (debounced flush)");
 
         // --- Initial device setup for all connected devices ---
-        for device in self.devices.values_mut() {
-            // 1. Clear the screen (the complete 5x3 grid; D200 ignores its
-            // unused bottom-right cell, D200X uses it).
-            if let Err(e) = device.clear_all_images().await {
-                error!("Failed to clear buttons for {}: {}", device.get_id(), e);
-            }
-
-            // 2. Apply brightness and label style from config
-            if let Err(e) = device.set_brightness(self.config.brightness).await {
-                error!("Failed to set brightness for {}: {}", device.get_id(), e);
-            }
-            if let Ok(label_style) = serde_json::to_value(&self.config.label_style) {
-                let _ = device.set_label_style(&label_style).await;
-            }
-
-            // 3. Start the small‑window data with zeros
-            let _ = device
-                .set_small_window_data(self.config.display_mode, 0, 0, "", 0)
-                .await;
-
-            // 4. Notify plugins that a device is connected
-            if let Some(ref tx) = self.hw_event_tx {
-                let _ = tx
-                    .send(HardwareEvent::DeviceConnected {
-                        device_id: device.get_id().to_string(),
-                    })
-                    .await;
-            }
-
-            // 5. Spawn reader task for button events
-            if let Some(mut reader) = device.take_reader() {
-                let tx = self.device_input_tx.clone();
-                let device_id = device.get_id().to_string();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        match reader.read_input_report(&mut buf).await {
-                            Ok(len) if len > 0 => {
-                                if let Some(event) = UlanziDevice::parse_input(&buf[..len]) {
-                                    if tx.send((device_id.clone(), event)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(_) => continue,
-                            Err(e) => {
-                                error!("Device {} read error: {}", device_id, e);
-                                break;
-                            }
-                        }
-                    }
-                    info!("Reader task finished for {}", device_id);
-                });
-            }
+        for device_id in self.devices.keys().cloned().collect::<Vec<_>>() {
+            self.setup_device(&device_id).await;
         }
+
 
         // --- Drain any initial plugin commands that arrived before the main loop ---
         let mut initial_commands = Vec::new();
@@ -169,6 +219,10 @@ impl UlanziDaemon {
         let mut keep_alive_interval = interval(Duration::from_millis(100));
         let mut system_monitor_interval =
             interval(Duration::from_millis(self.config.stats_interval_ms));
+        // Poll for the device so that plugging it in (or granting access to an
+        // already plugged one) does not require restarting OpenDeck.
+        let mut device_rescan_interval = interval(DEVICE_RESCAN_INTERVAL);
+        device_rescan_interval.tick().await;
 
         let shutdown = async {
             #[cfg(unix)]
@@ -197,6 +251,25 @@ impl UlanziDaemon {
 
             tokio::select! {
                 _ = &mut shutdown => break,
+
+                // Rescan for the device: pick up a newly plugged one, or one
+                // whose permissions only just became accessible.
+                _ = device_rescan_interval.tick() => {
+                    if self.try_connect().await {
+                        for device_id in self.devices.keys().cloned().collect::<Vec<_>>() {
+                            // Only set up devices that have no reader yet, i.e.
+                            // ones added by this very rescan.
+                            let needs_setup = self
+                                .devices
+                                .get(&device_id)
+                                .map(|d| d.has_reader())
+                                .unwrap_or(false);
+                            if needs_setup {
+                                self.setup_device(&device_id).await;
+                            }
+                        }
+                    }
+                }
 
                 // Handle WebSocket commands from OpenDeck plugin
                 Some(cmd) = async {

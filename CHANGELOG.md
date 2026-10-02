@@ -1,3 +1,9 @@
+# 0.7.1
+* Auto-reconnect: the plugin now rescans for the device every 2 seconds, so plugging it in later (or granting udev access while it is already plugged) works without restarting OpenDeck
+* Device disconnect is now reported to OpenDeck (deregisterDevice)
+* Hardened udev rule + install-udev-rules.sh helper that applies permissions without unplugging
+
+
 # 0.7.0
 * Unified plugin: D200, D200H and D200X are now managed by a single install
 * Image bundle covers the full 5x3 grid (15 slots), which is the full key count on the D200X

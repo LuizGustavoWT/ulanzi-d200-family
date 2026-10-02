@@ -2,7 +2,7 @@
   "Name": "Ulanzi D200 family",
   "Description": "Unified Linux support for the Ulanzi D200, D200H and D200X Stream Controllers, including D200X encoders",
   "Author": "glmagalhaes, mquest, mtesseract",
-  "Version": "0.7.0",
+  "Version": "0.7.1",
   "PluginUUID": "com.glmagalhaes.ulanzi.d200",
   "CodePathLin": "rs-ulanzi-d200-linux",
   "Icon": "assets/icon",
