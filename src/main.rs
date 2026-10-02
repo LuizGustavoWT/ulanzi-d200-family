@@ -147,14 +147,31 @@ async fn main() -> Result<()> {
                         let _ = openaction::device_plugin::key_up(device_id, key_index).await;
                     }
                     daemon::HardwareEvent::DeviceConnected { device_id } => {
-                        let _ = openaction::device_plugin::register_device(
-                            device_id,
-                            "Ulanzi D200 / D200H / D200X".to_string(),
-                            3,
-                            5,
-                            3,
-                            0,
-                        )
+                        // OpenDeck only knows rectangular square grids, so the
+                        // 5x3 keypad is declared as-is:
+                        //   row 0 -> keys 0..4
+                        //   row 1 -> keys 5..9
+                        //   row 2 -> keys 10..12 plus the double-width key 13
+                        // Key 14 is the phantom right half of the wide key and
+                        // is never sent to the firmware.
+                        //
+                        // `touchpoints` is not part of the typed openaction
+                        // helper, so the registerDevice event is sent as raw
+                        // JSON to also declare the two round side buttons the
+                        // D200X has below the keypad.
+                        let _ = openaction::send_arbitrary_json(serde_json::json!({
+                            "event": "registerDevice",
+                            "payload": {
+                                "id": device_id,
+                                "name": "Ulanzi D200 / D200H / D200X",
+                                "rows": 3,
+                                "columns": 5,
+                                "encoders": 3,
+                                "touchpoints": 2,
+                                "infobars": 0,
+                                "type": 0,
+                            },
+                        }))
                         .await;
                     }
                     daemon::HardwareEvent::EncoderRotate { device_id, position, ticks } => {

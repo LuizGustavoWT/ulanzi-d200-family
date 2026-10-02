@@ -1,3 +1,6 @@
+# 0.7.3
+* Register device with touchpoints: 2 so the D200X side buttons appear in the OpenDeck UI alongside the 3 encoders
+
 # 0.7.2
 * Correct D200X input mapping: 3 rotary encoders (volume) with press+rotate, 2 side buttons as touchpoints (15/16), grid layout 5+5+3+wide
 * Unit tests covering encoder rotate/press, side buttons, phantom key and normal keys
