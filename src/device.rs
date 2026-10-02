@@ -55,7 +55,11 @@ pub const WIDE_ICON_WIDTH: u32 = 392;
 pub const DIAL_BASE: usize = 17;
 pub const NUM_ENCODERS: usize = 3;
 /// D200X side buttons are reported inside the same index space as the dials.
-pub const SIDE_BUTTON_BASE: usize = DIAL_BASE + NUM_ENCODERS;
+/// Hardware indexes for the two side buttons (touchpoints).
+pub const SIDE_BUTTON_0: usize = 15;
+pub const SIDE_BUTTON_1: usize = 16;
+/// Byte 10 of an input report: 2 marks a rotary-encoder turn.
+const DIAL_ROTATE_MARKER: u8 = 2;
 const MAX_INPUT_INDEX: usize = 19;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
@@ -272,26 +276,46 @@ impl UlanziDevice {
 
     pub fn parse_input(buf: &[u8]) -> Option<InputEvent> {
         let raw = Self::parse_report(buf)?;
-        let is_dial = (DIAL_BASE..DIAL_BASE + NUM_ENCODERS).contains(&raw.index)
-            || raw.state == 2;
-        let is_side = (SIDE_BUTTON_BASE..=MAX_INPUT_INDEX).contains(&raw.index);
 
-        if is_dial && raw.index < SIDE_BUTTON_BASE {
+        // Side buttons (touchpoints) are hardware indexes 15 and 16, which sit
+        // directly after the 15 keypad slots. They are checked first so they
+        // are never misclassified as an encoder even if the firmware sets the
+        // rotation marker on them.
+        if raw.index == SIDE_BUTTON_0 || raw.index == SIDE_BUTTON_1 {
+            return Some(InputEvent::SideButton {
+                index: raw.index,
+                pressed: raw.pressed,
+            });
+        }
+
+        // The three rotary encoders report as indexes 17, 18 and 19. A press
+        // carries state 0/1, a turn carries the rotation marker in byte 10
+        // (2 = left, 3 = right). The index range alone identifies them, so the
+        // subtraction below cannot underflow.
+        let in_dial_range = (DIAL_BASE..DIAL_BASE + NUM_ENCODERS).contains(&raw.index);
+        if in_dial_range {
             let position = (raw.index - DIAL_BASE) as u8;
-            if raw.state == 2 {
+            if buf[10] == DIAL_ROTATE_MARKER {
                 let ticks = if buf[11] == 3 { 1 } else { -1 };
                 return Some(InputEvent::Encoder { position, ticks });
             }
-            return Some(InputEvent::EncoderPress { position, pressed: raw.pressed });
+            return Some(InputEvent::EncoderPress {
+                position,
+                pressed: raw.pressed,
+            });
         }
-        if is_side {
-            return Some(InputEvent::SideButton { index: raw.index, pressed: raw.pressed });
-        }
+
+        // The right half of the double-width screen is not addressable.
         if raw.index == PHANTOM_KEY {
             return None;
         }
-        Some(InputEvent::Key { index: raw.index, pressed: raw.pressed })
+
+        Some(InputEvent::Key {
+            index: raw.index,
+            pressed: raw.pressed,
+        })
     }
+
 
     // -- High‑level commands ------------------------------------------------
 
@@ -596,5 +620,109 @@ mod tests {
     fn test_generate_id_without_serial() {
         let id = UlanziDevice::generate_id(None, "fallback");
         assert_eq!(id, "e9-fallback");
+    }
+
+    /// Build a synthetic 12-byte input report the way the firmware does:
+    /// `7c 7c`, big-endian command, 4-byte length, then state/index/marker/payload.
+    fn report(command: u16, state: u8, index: u8, byte10: u8, byte11: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 12];
+        buf[0] = 0x7c;
+        buf[1] = 0x7c;
+        buf[2..4].copy_from_slice(&command.to_be_bytes());
+        buf[8] = state;
+        buf[9] = index;
+        buf[10] = byte10;
+        buf[11] = byte11;
+        buf
+    }
+
+    #[test]
+    fn test_parse_input_regular_key() {
+        let buf = report(0x0101, 1, 5, 0, 1);
+        match UlanziDevice::parse_input(&buf) {
+            Some(InputEvent::Key { index, pressed }) => {
+                assert_eq!(index, 5);
+                assert!(pressed);
+            }
+            other => panic!("expected Key, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_phantom_key_is_dropped() {
+        let buf = report(0x0101, 1, PHANTOM_KEY as u8, 0, 1);
+        assert!(UlanziDevice::parse_input(&buf).is_none());
+    }
+
+    #[test]
+    fn test_parse_input_side_buttons() {
+        for idx in [SIDE_BUTTON_0, SIDE_BUTTON_1] {
+            let pressed = report(0x0101, 1, idx as u8, 0, 1);
+            match UlanziDevice::parse_input(&pressed) {
+                Some(InputEvent::SideButton { index, pressed }) => {
+                    assert_eq!(index, idx);
+                    assert!(pressed);
+                }
+                other => panic!("expected SideButton for {idx}, got {:?}", other),
+            }
+
+            let released = report(0x0101, 0, idx as u8, 0, 0);
+            match UlanziDevice::parse_input(&released) {
+                Some(InputEvent::SideButton { index, pressed }) => {
+                    assert_eq!(index, idx);
+                    assert!(!pressed);
+                }
+                other => panic!("expected SideButton release for {idx}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_input_encoders_rotate_and_press() {
+        // Rotation: byte 10 == 2, byte 11 == 2 (left) or 3 (right).
+        for (idx, expected_pos) in [(17u8, 0u8), (18, 1), (19, 2)] {
+            let left = report(0x0101, 2, idx, 2, 2);
+            match UlanziDevice::parse_input(&left) {
+                Some(InputEvent::Encoder { position, ticks }) => {
+                    assert_eq!(position, expected_pos);
+                    assert_eq!(ticks, -1);
+                }
+                other => panic!("expected left rotation for {idx}, got {:?}", other),
+            }
+
+            let right = report(0x0101, 2, idx, 2, 3);
+            match UlanziDevice::parse_input(&right) {
+                Some(InputEvent::Encoder { position, ticks }) => {
+                    assert_eq!(position, expected_pos);
+                    assert_eq!(ticks, 1);
+                }
+                other => panic!("expected right rotation for {idx}, got {:?}", other),
+            }
+
+            // Press carries state 0/1 and no rotation marker.
+            let down = report(0x0101, 1, idx, 0, 1);
+            match UlanziDevice::parse_input(&down) {
+                Some(InputEvent::EncoderPress { position, pressed }) => {
+                    assert_eq!(position, expected_pos);
+                    assert!(pressed);
+                }
+                other => panic!("expected encoder press for {idx}, got {:?}", other),
+            }
+
+            let up = report(0x0101, 0, idx, 0, 0);
+            match UlanziDevice::parse_input(&up) {
+                Some(InputEvent::EncoderPress { position, pressed }) => {
+                    assert_eq!(position, expected_pos);
+                    assert!(!pressed);
+                }
+                other => panic!("expected encoder release for {idx}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_input_ignores_unknown_command() {
+        let buf = report(0x0999, 1, 3, 0, 1);
+        assert!(UlanziDevice::parse_input(&buf).is_none());
     }
 }

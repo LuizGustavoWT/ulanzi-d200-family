@@ -1,3 +1,7 @@
+# 0.7.2
+* Correct D200X input mapping: 3 rotary encoders (volume) with press+rotate, 2 side buttons as touchpoints (15/16), grid layout 5+5+3+wide
+* Unit tests covering encoder rotate/press, side buttons, phantom key and normal keys
+
 # 0.7.1
 * Auto-reconnect: the plugin now rescans for the device every 2 seconds, so plugging it in later (or granting udev access while it is already plugged) works without restarting OpenDeck
 * Device disconnect is now reported to OpenDeck (deregisterDevice)
