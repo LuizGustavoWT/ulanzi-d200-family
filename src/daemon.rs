@@ -93,6 +93,11 @@ impl UlanziDaemon {
     /// Connect to the first available Ulanzi device, if any, and insert it.
     /// Returns `true` when a new device was added.
     async fn try_connect(&mut self) -> bool {
+        // Already holding a device: do not reopen the HID handle just to
+        // rediscover it every few seconds.
+        if !self.devices.is_empty() {
+            return false;
+        }
         match UlanziDevice::connect().await {
             Ok(device) => {
                 let id = device.get_id().to_string();
@@ -430,9 +435,21 @@ impl UlanziDaemon {
         match cmd {
             BridgeEvent::SetImage {
                 device_id,
+                controller,
                 position,
                 image_base64,
             } => {
+                // Only keypad cells have a screen to paint. The D200X's three
+                // encoders and its two side buttons have no display of their
+                // own, so OpenDeck still sends us their icon but there is
+                // nothing to write it to.
+                if controller.as_deref() != Some("Keypad") {
+                    debug!(
+                        "Ignoring image for non-keypad controller {:?} position {}",
+                        controller, position
+                    );
+                    return;
+                }
                 let dev = if let Some(d) = self.devices.get_mut(&device_id) {
                     Some(d)
                 } else {
@@ -461,8 +478,12 @@ impl UlanziDaemon {
             }
             BridgeEvent::ClearImage {
                 device_id,
+                controller,
                 position,
             } => {
+                if controller.as_deref() != Some("Keypad") {
+                    return;
+                }
                 let dev = if let Some(d) = self.devices.get_mut(&device_id) {
                     Some(d)
                 } else {

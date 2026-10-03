@@ -2,13 +2,15 @@
   "Name": "Ulanzi D200 family",
   "Description": "Unified Linux support for the Ulanzi D200, D200H and D200X Stream Controllers, including D200X encoders",
   "Author": "glmagalhaes, mquest, mtesseract",
-  "Version": "0.7.3",
+  "Version": "0.8.0",
   "PluginUUID": "com.glmagalhaes.ulanzi.d200",
   "CodePathLin": "rs-ulanzi-d200-linux",
   "Icon": "assets/icon",
   "Category": "Ulanzi D200 family",
   "OS": [
-    { "Platform": "linux" }
+    {
+      "Platform": "linux"
+    }
   ],
   "Actions": [
     {
@@ -16,8 +18,30 @@
       "Name": "Screen Switch",
       "Icon": "assets/cycle",
       "Tooltip": "Switch modes of the status screen.",
-      "Controllers": ["Keypad"],
-      "States": [{ "Image": "assets/cycle" }]
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "assets/cycle"
+        }
+      ]
+    },
+    {
+      "UUID": "com.glmagalhaes.ulanzi.d200.rotary",
+      "Name": "Rotary",
+      "Icon": "assets/rotary",
+      "Tooltip": "Turn: run a command (use %d for ticks). Press: run another command. Place on an encoder or a key.",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "assets/rotary"
+        }
+      ],
+      "PropertyInspectorPath": "propertyInspector/rotary.html"
     }
   ],
   "DeviceNamespace": "e9"

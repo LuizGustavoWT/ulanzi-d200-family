@@ -4,6 +4,7 @@ mod device;
 mod openaction_client;
 mod system_monitor;
 mod action;
+mod action_rotary;
 
 use anyhow::Result;
 use clap::Parser;
@@ -129,6 +130,8 @@ async fn main() -> Result<()> {
         // Register the action with the cycle sender
         let cycle_action = action::CycleStatusWindow { cycle_tx: cycle_tx.clone() };
         register_action(cycle_action).await;
+        // Rotary action: configurable encoder (rotate + press).
+        register_action(action_rotary::RotaryAction).await;
 
         // Outbound events forwarder (unchanged)
         tokio::spawn(async move {

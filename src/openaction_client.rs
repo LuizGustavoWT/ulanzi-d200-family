@@ -12,11 +12,17 @@ use tokio::sync::mpsc;
 pub enum BridgeEvent {
     SetImage {
         device_id: String,
+        /// Which controller the image targets: "Keypad", "Encoder", ...
+        /// OpenDeck reuses the same 0-based `position` space for each
+        /// controller, so the encoder at position 0 must NOT be painted onto
+        /// keypad key 0.
+        controller: Option<String>,
         position: u8,
         image_base64: String,
     },
     ClearImage {
         device_id: String,
+        controller: Option<String>,
         position: u8,
     },
     SetBrightness {
@@ -53,11 +59,13 @@ impl GlobalEventHandler for OpenActionBridge {
     async fn device_plugin_set_image(&self, event: SetImageEvent) -> OpenActionResult<()> {
         if let Some(pos) = event.position {
             let device_id = event.device.clone();
+            let controller = event.controller.clone();
             if let Some(img) = event.image {
                 let _ = self
                     .tx
                     .send(BridgeEvent::SetImage {
                         device_id,
+                        controller,
                         position: pos,
                         image_base64: img,
                     })
@@ -67,6 +75,7 @@ impl GlobalEventHandler for OpenActionBridge {
                     .tx
                     .send(BridgeEvent::ClearImage {
                         device_id,
+                        controller,
                         position: pos,
                     })
                     .await;

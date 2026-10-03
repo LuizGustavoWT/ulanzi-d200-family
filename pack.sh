@@ -72,6 +72,12 @@ cp "$MANIFEST_SRC" "$TMP_DIR/$PLUGIN_FOLDER/"
 cp "$CONFIG_YAML" "$TMP_DIR/$PLUGIN_FOLDER/"
 cp -r "$ASSETS_SRC" "$TMP_DIR/$PLUGIN_FOLDER/"
 
+# Copy Property Inspector (HTML configuration UI)
+if [ -d "src/propertyInspector" ]; then
+    mkdir -p "$TMP_DIR/$PLUGIN_FOLDER/propertyInspector"
+    cp -r src/propertyInspector/. "$TMP_DIR/$PLUGIN_FOLDER/propertyInspector/"
+fi
+
 # ---------- Create zip ----------
 rm -f "$ZIP_NAME"
 cd "$TMP_DIR"

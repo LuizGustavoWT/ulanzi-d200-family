@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>Rotary Encoder</title>
+<style>
+:root {
+  --accent: #ff9f43;
+  --accent-dim: rgba(255, 159, 67, 0.15);
+  --bg: #1e1e1e;
+  --card: #262626;
+  --border: #3a3a3a;
+  --text: #e8e8e8;
+  --muted: #9a9a9a;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0; padding: 0;
+  font-size: 13px;
+}
+.header {
+  background: linear-gradient(135deg, var(--accent) 0%, #e8791f 100%);
+  color: #1a1a1a;
+  padding: 14px 16px;
+  font-weight: 700;
+  font-size: 15px;
+  display: flex; align-items: center; gap: 8px;
+}
+.header svg { width: 20px; height: 20px; fill: #1a1a1a; }
+.section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.section:last-child { border-bottom: none; }
+.label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+select, input[type="number"] {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+  appearance: none;
+  -webkit-appearance: none;
+}
+select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239a9a9a' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 30px;
+  cursor: pointer;
+}
+select:focus, input[type="number"]:focus {
+  border-color: var(--accent);
+}
+select option {
+  background: var(--card);
+  color: var(--text);
+}
+.hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+  line-height: 1.4;
+}
+.hint code {
+  background: var(--accent-dim);
+  color: var(--accent);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.step-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.step-row label {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.step-row input[type="number"] {
+  width: 70px;
+  text-align: center;
+}
+.custom-toggle {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  display: inline-block;
+}
+.custom-toggle:hover { opacity: 0.8; }
+.custom-field {
+  margin-top: 8px;
+  display: none;
+}
+.custom-field.visible { display: block; }
+.custom-field input[type="text"] {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 12px;
+  font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  outline: none;
+}
+.custom-field input[type="text"]:focus { border-color: var(--accent); }
+.hidden { display: none !important; }
+</style>
+<script>
+let update = () => {};
+
+// Presets for "On turn" (rotation)
+const TURN_PRESETS = [
+  { value: "volume",    label: "🔊 Volume (±step%)",     cmd: "wpctl set-volume @DEFAULT_AUDIO_SINK@ %v" },
+  { value: "media_seek",label: "⏩ Seek mídia (±step s)", cmd: "playerctl position --relative %d" },
+  { value: "brightness",label: "☀️ Brilho (±step%)",      cmd: "brightnessctl set %D%" },
+  { value: "scroll",    label: "📜 Scroll vertical",      cmd: "ydotool key 105:%a 106:%a" },
+  { value: "zoom",      label: "🔍 Zoom (Ctrl+Scroll)",   cmd: "xdotool key ctrl+Down ctrl+Up" },
+  { value: "custom",    label: "✏️ Comando personalizado", cmd: "" },
+];
+
+// Presets for "On press" (click)
+const PRESS_PRESETS = [
+  { value: "mute",       label: "🔇 Mute/Unmute",        cmd: "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" },
+  { value: "play_pause", label: "▶️ Play/Pause",          cmd: "playerctl play-pause" },
+  { value: "next_track", label: "⏭️ Próxima faixa",       cmd: "playerctl next" },
+  { value: "prev_track", label: "⏮️ Faixa anterior",      cmd: "playerctl previous" },
+  { value: "terminal",   label: "💻 Abrir terminal",      cmd: "x-terminal-emulator" },
+  { value: "custom",     label: "✏️ Comando personalizado", cmd: "" },
+];
+
+function connectElgatoStreamDeckSocket(inPort, inPropertyInspectorUUID, inRegisterEvent, inInfo, inActionInfo) {
+  const websocket = new WebSocket("ws://localhost:" + inPort);
+  inActionInfo = JSON.parse(inActionInfo);
+  const settings = inActionInfo.payload.settings || {};
+
+  websocket.onopen = () => {
+    websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inPropertyInspectorUUID }));
+  };
+
+  const turnSelect = document.getElementById("turn-preset");
+  const pressSelect = document.getElementById("press-preset");
+  const stepInput = document.getElementById("step");
+  const turnCustom = document.getElementById("turn-custom");
+  const pressCustom = document.getElementById("press-custom");
+  const turnCustomField = document.getElementById("turn-custom-field");
+  const pressCustomField = document.getElementById("press-custom-field");
+  const rotateSection = document.getElementById("rotate-section");
+
+  // Hide rotation section if not on an encoder
+  if (inActionInfo.payload.controller !== "Encoder") {
+    rotateSection.classList.add("hidden");
+  }
+
+  // Populate selects
+  TURN_PRESETS.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.value;
+    opt.textContent = p.label;
+    turnSelect.appendChild(opt);
+  });
+  PRESS_PRESETS.forEach(p => {
+    const opt = document.createElement("option");
+    opt.value = p.value;
+    opt.textContent = p.label;
+    pressSelect.appendChild(opt);
+  });
+
+  // Load saved settings
+  stepInput.value = settings.step || 5;
+
+  // Determine which preset matches the saved command
+  function matchPreset(cmd, presets) {
+    if (!cmd) return presets[0].value;
+    for (const p of presets) {
+      if (p.cmd && cmd.trim() === p.cmd.trim()) return p.value;
+    }
+    return "custom";
+  }
+
+  const turnPreset = matchPreset(settings.rotate, TURN_PRESETS);
+  const pressPreset = matchPreset(settings.press, PRESS_PRESETS);
+
+  turnSelect.value = turnPreset;
+  pressSelect.value = pressPreset;
+
+  if (turnPreset === "custom") {
+    turnCustom.value = settings.rotate || "";
+    turnCustomField.classList.add("visible");
+  }
+  if (pressPreset === "custom") {
+    pressCustom.value = settings.press || "";
+    pressCustomField.classList.add("visible");
+  }
+
+  function getRotateCmd() {
+    if (turnSelect.value === "custom") return turnCustom.value;
+    const p = TURN_PRESETS.find(x => x.value === turnSelect.value);
+    return p ? p.cmd : "";
+  }
+
+  function getPressCmd() {
+    if (pressSelect.value === "custom") return pressCustom.value;
+    const p = PRESS_PRESETS.find(x => x.value === pressSelect.value);
+    return p ? p.cmd : "";
+  }
+
+  update = () => {
+    websocket.send(JSON.stringify({
+      event: "setSettings",
+      context: inActionInfo.context,
+      payload: {
+        rotate: getRotateCmd(),
+        press: getPressCmd(),
+        step: parseInt(stepInput.value) || 1,
+      },
+    }));
+  };
+
+  turnSelect.onchange = () => {
+    turnCustomField.classList.toggle("visible", turnSelect.value === "custom");
+    update();
+  };
+  pressSelect.onchange = () => {
+    pressCustomField.classList.toggle("visible", pressSelect.value === "custom");
+    update();
+  };
+  turnCustom.oninput = update;
+  pressCustom.oninput = update;
+  stepInput.oninput = update;
+
+  // Send initial settings
+  update();
+}
+</script>
+</head>
+<body>
+<div class="wrapper">
+  <div class="header">
+    <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 4a6 6 0 1 1 0 12 6 6 0 0 1 0-12zm0 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+    Rotary Encoder
+  </div>
+
+  <!-- ON TURN -->
+  <div class="section" id="rotate-section">
+    <div class="label">Ao girar</div>
+    <select id="turn-preset"></select>
+    <div class="custom-field" id="turn-custom-field">
+      <input type="text" id="turn-custom" placeholder="wpctl set-volume @DEFAULT_AUDIO_SINK@ %v" />
+      <div class="hint"><code>%v</code> volume wpctl · <code>%d</code> ticks · <code>%a</code> absoluto</div>
+    </div>
+    <div class="step-row">
+      <label>Passo:</label>
+      <input type="number" id="step" min="1" max="100" value="5" />
+      <span style="font-size:11px;color:var(--muted)">× ticks por giro</span>
+    </div>
+  </div>
+
+  <!-- ON PRESS -->
+  <div class="section">
+    <div class="label">Ao pressionar</div>
+    <select id="press-preset"></select>
+    <div class="custom-field" id="press-custom-field">
+      <input type="text" id="press-custom" placeholder="wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" />
+    </div>
+  </div>
+</div>
+</body>
+</html>

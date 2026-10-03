@@ -1,3 +1,14 @@
+# 0.8.0
+* New "Rotary" action with a dropdown-based Property Inspector: pick a preset (volume, media, brightness, scroll) instead of typing a shell command
+* Configurable Step multiplier so one detent can move 1, 5, 10 percent or more
+* Commands run on the host via flatpak-spawn, since the OpenDeck Flatpak ships no wpctl/playerctl/brightnessctl
+* Placeholders: %v (wpctl relative volume), %d (signed ticks), %a (absolute), %% (literal percent)
+* Fixed encoder reports: byte 10 flags encoder traffic, byte 11 carries the dial event (0 release, 1 press, 2 left, 3 right)
+* Fixed encoder images being painted onto keypad keys 1/2/3; non-Keypad controllers are now ignored
+* Side buttons 15/16 no longer raise "button index out of range" when OpenDeck paints their icon
+* ULANZI_INVERT_DIAL=1 flips encoder direction for units wired the other way round
+* pack-local.sh builds and installs straight into the OpenDeck plugin folder, no git or release needed
+
 # 0.7.3
 * Register device with touchpoints: 2 so the D200X side buttons appear in the OpenDeck UI alongside the 3 encoders
 

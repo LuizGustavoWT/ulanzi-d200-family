@@ -58,8 +58,12 @@ pub const NUM_ENCODERS: usize = 3;
 /// Hardware indexes for the two side buttons (touchpoints).
 pub const SIDE_BUTTON_0: usize = 15;
 pub const SIDE_BUTTON_1: usize = 16;
-/// Byte 10 of an input report: 2 marks a rotary-encoder turn.
-const DIAL_ROTATE_MARKER: u8 = 2;
+/// Byte 10 of an encoder input report carries the dial event itself:
+/// 0 = released, 1 = pressed, 2 = turned counterclockwise, 3 = turned clockwise.
+const DIAL_RELEASE: u8 = 0;
+const DIAL_PRESS: u8 = 1;
+const DIAL_TURN_LEFT: u8 = 2;
+const DIAL_TURN_RIGHT: u8 = 3;
 const MAX_INPUT_INDEX: usize = 19;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
@@ -288,21 +292,45 @@ impl UlanziDevice {
             });
         }
 
-        // The three rotary encoders report as indexes 17, 18 and 19. A press
-        // carries state 0/1, a turn carries the rotation marker in byte 10
-        // (2 = left, 3 = right). The index range alone identifies them, so the
-        // subtraction below cannot underflow.
+        // The three rotary encoders report as indexes 17, 18 and 19.
+        //
+        // Firmware layout (matching the reference implementation):
+        //   byte 10 (body[2]) == 2 marks the report as encoder traffic
+        //   byte 11 (body[3]) is the dial event:
+        //     0 = release, 1 = press, 2 = turn left, 3 = turn right
         let in_dial_range = (DIAL_BASE..DIAL_BASE + NUM_ENCODERS).contains(&raw.index);
         if in_dial_range {
             let position = (raw.index - DIAL_BASE) as u8;
-            if buf[10] == DIAL_ROTATE_MARKER {
-                let ticks = if buf[11] == 3 { 1 } else { -1 };
-                return Some(InputEvent::Encoder { position, ticks });
+            let dial_event = buf[11];
+            debug!(
+                "Encoder raw: dial={} state={} b10={} b11={}",
+                position, raw.state, buf[10], dial_event
+            );
+            match dial_event {
+                DIAL_TURN_LEFT | DIAL_TURN_RIGHT => {
+                    // The reference maps 2 -> -1 (left) and 3 -> +1 (right).
+                    // Some D200X units wire the encoder the other way round, so
+                    // ULANZI_INVERT_DIAL=1 flips it without a rebuild.
+                    let mut ticks = if dial_event == DIAL_TURN_RIGHT { 1 } else { -1 };
+                    if std::env::var("ULANZI_INVERT_DIAL")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
+                        ticks = -ticks;
+                    }
+                    return Some(InputEvent::Encoder { position, ticks });
+                }
+                DIAL_PRESS => {
+                    return Some(InputEvent::EncoderPress { position, pressed: true });
+                }
+                DIAL_RELEASE => {
+                    return Some(InputEvent::EncoderPress { position, pressed: false });
+                }
+                other => {
+                    debug!("Unknown encoder event {other} from dial {position}");
+                    return None;
+                }
             }
-            return Some(InputEvent::EncoderPress {
-                position,
-                pressed: raw.pressed,
-            });
         }
 
         // The right half of the double-width screen is not addressable.
@@ -355,15 +383,21 @@ impl UlanziDevice {
     /// Returns `Ok(true)` if the image was new/different, `Ok(false)` if unchanged.
     /// Call `flush()` to apply all staged images.
     pub async fn set_button_image(&self, index: usize, image_data: &str) -> Result<bool> {
+        // Touchpoints 15/16 are the round side buttons: they have no display, so
+        // OpenDeck still sends us an image for them but there is nothing to draw.
+        if index == SIDE_BUTTON_0 || index == SIDE_BUTTON_1 {
+            debug!("Ignoring image for display-less touchpoint {}", index);
+            return Ok(false);
+        }
+        if index == PHANTOM_KEY {
+            return Err(anyhow!("Button index {} is the phantom half of the wide screen", index));
+        }
         if index >= NUM_BUTTONS {
             return Err(anyhow!(
                 "Button index {} out of range (0..{})",
                 index,
                 NUM_BUTTONS - 1
             ));
-        }
-        if index == PHANTOM_KEY {
-            return Err(anyhow!("Button index {} is the phantom half of the wide screen", index));
         }
 
         let png_data = if image_data.starts_with("data:") {
@@ -415,6 +449,9 @@ impl UlanziDevice {
 
     /// Remove a staged button image (will be cleared on next `flush()`).
     pub fn clear_button_image(&self, index: usize) {
+        if index == SIDE_BUTTON_0 || index == SIDE_BUTTON_1 || index == PHANTOM_KEY {
+            return;
+        }
         if index >= NUM_BUTTONS {
             warn!("Attempt to clear out‑of‑range button index {}", index);
             return;
@@ -679,7 +716,8 @@ mod tests {
 
     #[test]
     fn test_parse_input_encoders_rotate_and_press() {
-        // Rotation: byte 10 == 2, byte 11 == 2 (left) or 3 (right).
+        // Firmware layout: byte 10 marks encoder traffic (== 2), byte 11 is
+        // the dial event (0 = release, 1 = press, 2 = left, 3 = right).
         for (idx, expected_pos) in [(17u8, 0u8), (18, 1), (19, 2)] {
             let left = report(0x0101, 2, idx, 2, 2);
             match UlanziDevice::parse_input(&left) {
@@ -699,8 +737,9 @@ mod tests {
                 other => panic!("expected right rotation for {idx}, got {:?}", other),
             }
 
-            // Press carries state 0/1 and no rotation marker.
-            let down = report(0x0101, 1, idx, 0, 1);
+            // Press and release are both flagged by byte 10 == 2, with the
+            // actual event in byte 11.
+            let down = report(0x0101, 1, idx, 2, 1);
             match UlanziDevice::parse_input(&down) {
                 Some(InputEvent::EncoderPress { position, pressed }) => {
                     assert_eq!(position, expected_pos);
@@ -709,7 +748,7 @@ mod tests {
                 other => panic!("expected encoder press for {idx}, got {:?}", other),
             }
 
-            let up = report(0x0101, 0, idx, 0, 0);
+            let up = report(0x0101, 0, idx, 2, 0);
             match UlanziDevice::parse_input(&up) {
                 Some(InputEvent::EncoderPress { position, pressed }) => {
                     assert_eq!(position, expected_pos);
