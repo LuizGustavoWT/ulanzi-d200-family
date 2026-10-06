@@ -682,9 +682,9 @@ impl UlanziDevice {
             map.clone()
         };
         // Hardware bug workaround (see CHANGELOG 0.5.0/0.6.0): the firmware
-        // crashes when specific byte values land at 1024-aligned offsets past
-        // ~92 kB inside the uploaded bundle, so the archive is rebuilt until
-        // those offsets are clean.
+        // rejects the uploaded bundle when specific byte values land at the
+        // start of any packet, so the archive is rebuilt until every packet
+        // boundary is clean.
         //
         // Critically, the size of the bundle must NOT grow between attempts.
         // The original implementation padded a dummy file by 1024*retries
@@ -699,12 +699,25 @@ impl UlanziDevice {
         // in-place padding. That moves the compressed bytes around without
         // changing how many offsets have to be checked.
         const MAX_RETRIES: usize = 64;
-        // First offset the firmware actually parses as payload.
-        const FIRST_CHECKED_OFFSET: usize = 92152;
         const OFFSET_STEP: usize = 1024;
         // Small, fixed-size slack so the archive can be nudged without ever
         // adding a new checked offset.
         const PAD_SLACK: usize = 512;
+        // Wall-clock ceiling for the retry hunt.
+        const RETRY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(600);
+
+        // The header packet carries the first 1016 bytes of the ZIP, so every
+        // following packet starts at 1016 + n * 1024. The firmware rejects the
+        // bundle if *any* of those packets starts with an invalid byte, so the
+        // whole archive has to be checked, not just its tail.
+        const FIRST_PACKET_BOUNDARY: usize = 1016;
+
+        // Rebuilding and re-checking a large archive is not free, and for a
+        // big bundle the odds of finding a byte-clean one are low (every
+        // packet boundary has to pass). Cap the time spent hunting so a hard
+        // scene can never turn into a multi-minute freeze, and fall back to the
+        // best attempt found so far.
+        let hunt_deadline = std::time::Instant::now() + RETRY_TIME_BUDGET;
 
         let mut retries = 0usize;
         let mut best: Option<(usize, Vec<u8>)> = None;
@@ -712,7 +725,7 @@ impl UlanziDevice {
             let pad = (retries % 64) * (PAD_SLACK / 64);
             let bundle = Self::build_bundle(&images_snapshot, pad, retries)?;
 
-            match Self::first_bad_offset(&bundle, FIRST_CHECKED_OFFSET, OFFSET_STEP) {
+            match Self::first_bad_offset(&bundle, FIRST_PACKET_BOUNDARY, OFFSET_STEP) {
                 None => break bundle,
                 Some(offset) => {
                     // Keep the attempt that got furthest past the bad offset.
@@ -724,7 +737,7 @@ impl UlanziDevice {
                         best = Some((offset, bundle));
                     }
                     retries += 1;
-                    if retries >= MAX_RETRIES {
+                    if retries >= MAX_RETRIES || std::time::Instant::now() >= hunt_deadline {
                         // Sending a bundle that still trips the firmware bug is
                         // far better than giving up: not sending anything at all
                         // leaves the previous (possibly blank) screen in place
