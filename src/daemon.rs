@@ -26,6 +26,7 @@ pub enum HardwareEvent {
     EncoderDown { device_id: String, position: u8 },
     EncoderUp { device_id: String, position: u8 },
     DeviceConnected { device_id: String },
+    #[allow(dead_code)]
     DeviceDisconnected { device_id: String },
 }
 
@@ -84,7 +85,7 @@ impl UlanziDaemon {
             device_input_tx,
             flush_deadline: None,
             last_flush_time: None,
-            debounce_delay: Duration::from_millis(50),
+            debounce_delay: Duration::from_millis(30),
             min_flush_interval: Duration::from_millis(20),
             cycle_rx,
         })
@@ -122,11 +123,11 @@ impl UlanziDaemon {
             return;
         };
 
-        // 1. Clear the screen (the complete 5x3 grid; D200 ignores its
-        // unused bottom-right cell, D200X uses it).
-        if let Err(e) = device.clear_all_images().await {
-            error!("Failed to clear buttons for {}: {}", device.get_id(), e);
-        }
+        // 1. Reset the staged icons locally, but do NOT push an empty bundle.
+        //    Blanking the whole grid here makes every key go black until
+        //    OpenDeck's first image batch lands, which reads as a dead screen.
+        //    The grid stays marked dirty, so the first real flush paints it.
+        device.forget_all_images();
 
         // 2. Apply brightness and label style from config
         if let Err(e) = device.set_brightness(self.config.brightness).await {
@@ -178,6 +179,7 @@ impl UlanziDaemon {
     }
 
     /// Remove a device that stopped answering, telling OpenDeck it is gone.
+    #[allow(dead_code)]
     async fn drop_device(&mut self, device_id: &str) {
         if self.devices.remove(device_id).is_none() {
             return;
@@ -370,28 +372,21 @@ impl UlanziDaemon {
     async fn perform_flush(&mut self) {
         self.flush_deadline = None;
 
-        // Wrap the flush operation in a timeout.
-        let flush_future = async {
-            for device in self.devices.values() {
-                if let Err(e) = device.flush().await {
-                    info!("Failed to flush device {}: {}", device.get_id(), e);
-                    // Continue with other devices (if any) – don't break.
-                }
-            }
-            self.last_flush_time = Some(Instant::now());
-            debug!("Flush completed (or attempted)");
-        };
-
-        match tokio::time::timeout(Duration::from_secs(2), flush_future).await {
-            Ok(_) => {
-                // Flush finished within timeout (success or logged error).
-            }
-            Err(_) => {
-                info!("Flush timed out after 2 seconds – device may be stuck");
-                // Still update last_flush_time to avoid immediate retry storms.
-                self.last_flush_time = Some(Instant::now());
+        // No timeout here on purpose. Aborting a flush mid-transfer tears the
+        // ZIP stream in half, and the firmware then ends up with a truncated
+        // icon bundle: the screens go blank instead of showing the new page.
+        // A slow transfer is far less harmful than a corrupted one.
+        let t0 = Instant::now();
+        for device in self.devices.values() {
+            if let Err(e) = device.flush().await {
+                info!("Failed to flush device {}: {}", device.get_id(), e);
+                // Continue with other devices (if any) – don't break.
             }
         }
+        self.last_flush_time = Some(Instant::now());
+        // At info level so a user can read real timings from the log and tell
+        // whether the deck is slow to paint or the plugin is slow to send.
+        info!("Flush completed in {:?}", t0.elapsed());
     }
 
     async fn handle_device_event(&mut self, device_id: &str, event: InputEvent) {
@@ -497,6 +492,12 @@ impl UlanziDaemon {
                         index
                     );
                     dev.clear_button_image(index);
+                    // A scene switch typically arrives as ClearImage followed by
+                    // SetImage for the same slot. If a flush fired between the
+                    // two, the device would receive a bundle with that slot
+                    // blanked out and paint it empty for a moment. Give the
+                    // replacement image time to land first.
+                    self.schedule_flush();
                 } else {
                     warn!("ClearImage: No target device found for {}", device_id);
                 }

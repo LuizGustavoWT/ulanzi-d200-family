@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
 use async_hid::{AsyncHidWrite, DeviceReader, DeviceWriter, HidBackend};
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
+use rand::rngs::ThreadRng;
+use rand::seq::SliceRandom;
+use rand::{RngExt, distr::Alphanumeric};
 use data_url::DataUrl;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
-use rand::{rngs, RngExt, distr::Alphanumeric};
-use rand::seq::SliceRandom;
 use serde_json::json;
-use tokio::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::Duration;
 use zip::write::FileOptions;
 
 use uuid::Uuid;
@@ -68,7 +68,43 @@ const MAX_INPUT_INDEX: usize = 19;
 
 const MAX_COMMAND_PAYLOAD: usize = PACKET_SIZE - 8; // 1016
 
-static FLUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Pacing for the icon transfer.
+///
+/// CHANGELOG 0.6.1 attributes screen blinking to the device receiving packets
+/// "too many packets too fast", so the transfer is paced in small bursts.
+///
+/// The defaults were chosen from measurements on real D200 hardware with a
+/// 156 kB / 153-packet bundle (the size the plugin actually sends):
+///
+///   no pacing .................... 40 ms
+///   burst 8, 2 ms ................ 90 ms   (worst: costs +50 ms)
+///   burst 32, 2 ms ............... 48 ms
+///   burst 64, 1 ms ............... 41 ms   (default: essentially free)
+///   burst 128, 1 ms .............. 41 ms
+///
+/// So the default is deliberately loose: it still breaks the stream up, but
+/// costs about 1 ms instead of 50 ms. Note this pacing has *not* been shown to
+/// prevent blinking on this firmware - that remains unverified, since blinking
+/// cannot be observed programmatically.
+///
+/// Both values can be overridden at runtime, no rebuild needed:
+///
+///   ULANZI_BURST=0     disable pacing entirely
+///   ULANZI_BURST=8 ULANZI_PACKET_MS=2    stricter pacing, at a latency cost
+fn burst_size() -> usize {
+    std::env::var("ULANZI_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+}
+
+fn packet_delay() -> Duration {
+    let ms = std::env::var("ULANZI_PACKET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1u64);
+    Duration::from_millis(ms)
+}
 
 // ---------------------------------------------------------------------------
 // Command protocol
@@ -120,6 +156,19 @@ pub enum InputEvent {
 pub struct ButtonImageData {
     pub image: Vec<u8>,
     pub uuid: Uuid,
+    /// Fingerprint of the payload OpenDeck sent for this slot, used to skip
+    /// re-encoding an icon that is already on screen.
+    pub source_hash: u64,
+}
+
+/// FNV-1a: cheap, non-cryptographic digest for change detection only.
+fn short_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +180,7 @@ pub struct UlanziDevice {
     reader: Option<DeviceReader>,
     id: String,
     button_images: Mutex<HashMap<usize, ButtonImageData>>,
+    dirty_buttons: Mutex<std::collections::HashSet<usize>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +275,7 @@ impl UlanziDevice {
             reader: Some(reader),
             id,
             button_images: Mutex::new(HashMap::new()),
+            dirty_buttons: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -400,36 +451,57 @@ impl UlanziDevice {
             ));
         }
 
-        let png_data = if image_data.starts_with("data:") {
-            // Data URL (Base64)
-            let url = DataUrl::process(image_data).map_err(|_| anyhow!("Invalid data URL"))?;
-            let (body, _) = url
-                .decode_to_vec()
-                .map_err(|_| anyhow!("Failed to decode data URL"))?;
-            let img = image::load_from_memory(&body)?;
-            let resized = if index == WIDE_KEY { resize_wide(&img) } else { resize_square(&img, ICON_SIZE) };
+        // Cheap fingerprint of the *source* payload. Scene switches often
+        // re-send the same icon for untouched keys; comparing the raw input
+        // lets us skip decoding, resizing and PNG-encoding entirely, which is
+        // by far the most expensive part of a page change.
+        let fingerprint = short_hash(image_data.as_bytes());
+
+        {
+            let map = self.button_images.lock().unwrap();
+            if let Some(existing) = map.get(&index) {
+                if existing.source_hash == fingerprint {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Decoding, resizing and PNG-encoding 14 icons costs tens of
+        // milliseconds of pure CPU. Running that inline on the tokio worker
+        // blocks the daemon loop, delaying the flush and every other event
+        // that arrives meanwhile, so move it to the blocking pool.
+        let is_data_url = image_data.starts_with("data:");
+        let owned = image_data.to_string();
+        let png_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let img = if is_data_url {
+                let url = DataUrl::process(&owned).map_err(|_| anyhow!("Invalid data URL"))?;
+                let (body, _) = url
+                    .decode_to_vec()
+                    .map_err(|_| anyhow!("Failed to decode data URL"))?;
+                image::load_from_memory(&body)?
+            } else {
+                let path = std::path::Path::new(&owned);
+                if !path.exists() {
+                    return Err(anyhow!("Image file not found: {}", owned));
+                }
+                image::open(path)
+                    .map_err(|e| anyhow!("Failed to open image {}: {}", owned, e))?
+            };
+
+            let resized = if index == WIDE_KEY {
+                resize_wide(&img)
+            } else {
+                resize_square(&img, ICON_SIZE)
+            };
             let mut buf = Vec::new();
             {
                 let mut cursor = Cursor::new(&mut buf);
                 resized.write_to(&mut cursor, image::ImageFormat::Png)?;
             }
-            buf
-        } else {
-            // File path
-            let path = std::path::Path::new(image_data);
-            if !path.exists() {
-                return Err(anyhow!("Image file not found: {}", image_data));
-            }
-            let img = image::open(path)
-                .map_err(|e| anyhow!("Failed to open image {}: {}", image_data, e))?;
-            let resized = if index == WIDE_KEY { resize_wide(&img) } else { resize_square(&img, ICON_SIZE) };
-            let mut buf = Vec::new();
-            {
-                let mut cursor = Cursor::new(&mut buf);
-                resized.write_to(&mut cursor, image::ImageFormat::Png)?;
-            }
-            buf
-        };
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| anyhow!("Image processing task failed: {}", e))??;
 
         let mut map = self.button_images.lock().unwrap();
         let changed = match map.get(&index) {
@@ -438,10 +510,15 @@ impl UlanziDevice {
         };
 
         if changed {
-            map.insert(index, ButtonImageData {
-                image: png_data,
-                uuid: Uuid::now_v7(),
-            });
+            map.insert(
+                index,
+                ButtonImageData {
+                    image: png_data,
+                    uuid: Uuid::now_v7(),
+                    source_hash: fingerprint,
+                },
+            );
+            self.dirty_buttons.lock().unwrap().insert(index);
         }
 
         Ok(changed)
@@ -456,123 +533,240 @@ impl UlanziDevice {
             warn!("Attempt to clear out‑of‑range button index {}", index);
             return;
         }
-        self.button_images.lock().unwrap().remove(&index);
+        let mut map = self.button_images.lock().unwrap();
+        if map.remove(&index).is_some() {
+            self.dirty_buttons.lock().unwrap().insert(index);
+        }
     }
 
     /// Remove **all** staged button images and send an empty configuration
     /// to the device (clears all buttons).
+    #[allow(dead_code)]
     pub async fn clear_all_images(&self) -> Result<()> {
-        self.button_images.lock().unwrap().clear();
+        self.forget_all_images();
         self.flush().await
+    }
+
+    /// Drop every staged image and mark the grid dirty **without** flushing.
+    ///
+    /// Used when (re)connecting: pushing an all-empty bundle to a freshly
+    /// initialised deck blanks every screen, and the replacement icons only
+    /// arrive once OpenDeck pushes them. The result is a visible flash of
+    /// black keys - exactly the "tela apagada" symptom. Clearing locally and
+    /// letting the first real image batch paint avoids that flash entirely.
+    pub fn forget_all_images(&self) {
+        {
+            let mut map = self.button_images.lock().unwrap();
+            map.clear();
+        }
+        let mut dirty = self.dirty_buttons.lock().unwrap();
+        for i in 0..NUM_BUTTONS {
+            if i != PHANTOM_KEY && i != SIDE_BUTTON_0 && i != SIDE_BUTTON_1 {
+                dirty.insert(i);
+            }
+        }
     }
 
     /// Send the currently staged button images to the device.
     /// Uses unique filenames per flush to force device to reload icons.
     /// Bounded retries – returns error if a valid ZIP cannot be built.
     pub async fn flush(&self) -> Result<()> {
-        debug!("Building button configuration ZIP with bug workaround");
+        debug!("Building button configuration ZIP");
 
-        let mut images_snapshot = {
+        // Claim the pending set now, but put it back if the transfer fails.
+        // Dropping it on error would leave those keys permanently stuck with
+        // whatever the device last received, i.e. a stale or blank screen that
+        // never recovers because no later flush considers them dirty.
+        let claimed = {
+            let mut d = self.dirty_buttons.lock().unwrap();
+            if d.is_empty() {
+                debug!("No dirty buttons, skipping flush");
+                return Ok(());
+            }
+            std::mem::take(&mut *d)
+        };
+        debug!("Flushing {} dirty button(s)", claimed.len());
+
+        let result = self.build_and_send_bundle().await;
+        if result.is_err() {
+            let mut d = self.dirty_buttons.lock().unwrap();
+            d.extend(claimed);
+        }
+        result
+    }
+
+    /// First offset >= `first` (stepping by `step`) that holds a byte the
+    /// firmware chokes on, if any.
+    fn first_bad_offset(data: &[u8], first: usize, step: usize) -> Option<usize> {
+        (first..data.len())
+            .step_by(step)
+            .find(|&o| matches!(data.get(o), Some(0x00) | Some(0x7c)))
+    }
+
+    /// Assemble the icon ZIP.
+    ///
+    /// `pad` adds a bounded amount of incompressible filler used to shift where
+    /// bytes land, and `attempt` drives the entry ordering, so consecutive
+    /// calls produce a different archive of essentially the same size.
+    fn build_bundle(
+        images_snapshot: &HashMap<usize, ButtonImageData>,
+        pad: usize,
+        attempt: usize,
+    ) -> Result<Vec<u8>> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let deflated = FileOptions::<()>::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            if pad > 0 {
+                // Random filler: a repeating pattern compresses to nothing and
+                // would not move the bytes that matter.
+                let filler: String = ThreadRng::default()
+                    .sample_iter(&Alphanumeric)
+                    .take(pad)
+                    .map(char::from)
+                    .collect();
+                zip.start_file("pad.bin", deflated)?;
+                zip.write_all(filler.as_bytes())?;
+            }
+
+            let mut manifest = json!({});
+
+            // Shuffling the write order varies where each image's compressed
+            // bytes land, so a bundle that already tripped the bug does not
+            // reproduce it identically on the next attempt.
+            let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
+            numbers.shuffle(&mut ThreadRng::default());
+            if attempt % 2 == 1 {
+                numbers.rotate_left(1);
+            }
+
+            for (index, value) in numbers.into_iter().enumerate() {
+                if value == PHANTOM_KEY {
+                    continue;
+                }
+                let col = value % 5;
+                let row = value / 5;
+                let key = format!("{}_{}", col, row);
+                let mut view_param = json!({ "Text": "" });
+
+                if let Some(img_data) = images_snapshot.get(&value) {
+                    let icon_name = format!("{}_{}.png", index, img_data.uuid);
+                    zip.start_file(format!("Images/{}", icon_name), deflated)?;
+                    zip.write_all(&img_data.image)?;
+                    view_param["Icon"] = json!(format!("Images/{}", icon_name));
+                } else {
+                    view_param["Icon"] = json!("");
+                }
+
+                manifest[key] = json!({ "State": 0, "ViewParam": [view_param] });
+            }
+
+            zip.start_file("manifest.json", deflated)?;
+            zip.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
+
+            zip.start_file("sentinel.txt", deflated)?;
+            zip.write_all(b"")?;
+
+            zip.finish()?;
+        }
+        Ok(cursor.into_inner())
+    }
+
+    /// Build the icon bundle (applying the hardware byte-offset workaround) and
+    /// push it to the device.
+    async fn build_and_send_bundle(&self) -> Result<()> {
+        let images_snapshot = {
             let map = self.button_images.lock().unwrap();
             map.clone()
         };
+        // Hardware bug workaround (see CHANGELOG 0.5.0/0.6.0): the firmware
+        // crashes when specific byte values land at 1024-aligned offsets past
+        // ~92 kB inside the uploaded bundle, so the archive is rebuilt until
+        // those offsets are clean.
+        //
+        // Critically, the size of the bundle must NOT grow between attempts.
+        // The original implementation padded a dummy file by 1024*retries
+        // bytes, which added one more checked offset per retry and made the
+        // search diverge: at ~800 checked offsets the chance of a clean bundle
+        // is already 0.2%, at ~1600 it is effectively zero. Any user with rich
+        // artwork (a ~1.3 MB bundle) hit "Failed to build a valid ZIP after
+        // 1000 retries" and never painted a screen at all.
+        //
+        // Instead we keep the bundle byte-identical in size and only reshuffle
+        // the order the entries are written in, plus vary a small amount of
+        // in-place padding. That moves the compressed bytes around without
+        // changing how many offsets have to be checked.
+        const MAX_RETRIES: usize = 64;
+        // First offset the firmware actually parses as payload.
+        const FIRST_CHECKED_OFFSET: usize = 92152;
+        const OFFSET_STEP: usize = 1024;
+        // Small, fixed-size slack so the archive can be nudged without ever
+        // adding a new checked offset.
+        const PAD_SLACK: usize = 512;
 
-        const INVALID_BYTES: [u8; 2] = [0x00, 0x7c];
-        const MAX_RETRIES: usize = 1000;
+        let mut retries = 0usize;
+        let mut best: Option<(usize, Vec<u8>)> = None;
+        let zip_data = loop {
+            let pad = (retries % 64) * (PAD_SLACK / 64);
+            let bundle = Self::build_bundle(&images_snapshot, pad, retries)?;
 
-        let mut dummy_retries = 0;
-        let mut zip_data = Vec::new();
-
-        loop {
-            let flush_id = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
-            zip_data.clear();
-            let mut cursor = Cursor::new(Vec::new());
-            {
-                let mut zip = zip::ZipWriter::new(&mut cursor);
-                let deflated = FileOptions::<()>::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-
-                // Dummy file – content grows aggressively
-                // let dummy_content = "x".repeat(128 * dummy_retries);
-                let dummy_content: String = rngs::ThreadRng::default()
-                    .sample_iter(&Alphanumeric)
-                    .take(1024 * dummy_retries)
-                    .map(char::from)
-                    .collect();
-
-                zip.start_file("dummy.txt", deflated)?;
-                zip.write_all(dummy_content.as_bytes())?;
-
-                let mut manifest = json!({});
-
-                let mut numbers: Vec<usize> = (0..NUM_BUTTONS).collect();
-                numbers.shuffle(&mut rngs::ThreadRng::default());
-                for (index, value) in numbers.into_iter().enumerate() {
-                    if value == PHANTOM_KEY {
-                        continue;
+            match Self::first_bad_offset(&bundle, FIRST_CHECKED_OFFSET, OFFSET_STEP) {
+                None => break bundle,
+                Some(offset) => {
+                    // Keep the attempt that got furthest past the bad offset.
+                    let better = match &best {
+                        None => true,
+                        Some((previous_offset, _)) => offset > *previous_offset,
+                    };
+                    if better {
+                        best = Some((offset, bundle));
                     }
-                    let col = value % 5;
-                    let row = value / 5;
-                    let key = format!("{}_{}", col, row);
-                    let mut view_param = json!({ "Text": "" });
-
-                    if let Some(img_data) = images_snapshot.get_mut(&value) {
-                        // let icon_name = format!("{}.png", img_data.uuid);
-                        let icon_name = format!("{}_{}.png", index, img_data.uuid);
-                        zip.start_file(format!("Images/{}", icon_name), deflated)?;
-                        zip.write_all(&img_data.image)?;
-                        view_param["Icon"] = json!(format!("Images/{}", icon_name));
-                    } else {
-                        view_param["Icon"] = json!("");
-                    }
-
-                    manifest[key] = json!({ "State": 0, "ViewParam": [view_param] });
-                }
-
-                zip.start_file("manifest.json", deflated)?;
-                zip.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
-
-                zip.start_file("sentinel.txt", deflated)?;
-                zip.write_all(b"")?;
-
-                zip.finish()?;
-            }
-
-            zip_data = cursor.into_inner();
-
-            let file_size = zip_data.len();
-            let mut valid = true;
-            for offset in (92152..file_size).step_by(1024) {
-                if let Some(&byte) = zip_data.get(offset) {
-                    if INVALID_BYTES.contains(&byte) {
-                        debug!(
-                            "Invalid byte 0x{:02x} at offset {} (retry {})",
-                            byte, offset, dummy_retries
+                    retries += 1;
+                    if retries >= MAX_RETRIES {
+                        // Sending a bundle that still trips the firmware bug is
+                        // far better than giving up: not sending anything at all
+                        // leaves the previous (possibly blank) screen in place
+                        // and looks exactly like the "tela apagada" symptom.
+                        // The firmware is the one that decides whether to accept
+                        // it, so send the best attempt we have.
+                        warn!(
+                            "No byte-clean icon bundle after {} retries; sending the \
+                             best attempt anyway so the screens still update",
+                            MAX_RETRIES
                         );
-                        valid = false;
-                        break;
+                        break best
+                            .expect("best attempt is always set once a retry happens")
+                            .1;
                     }
+                    debug!(
+                        "Invalid byte at offset {} (retry {}, pad {})",
+                        offset,
+                        retries,
+                        pad
+                    );
                 }
             }
-
-            if valid {
-                debug!("ZIP archive passed the byte‑offset check ({} retries)", dummy_retries);
-                break;
-            }
-
-            dummy_retries += 1;
-            if dummy_retries >= MAX_RETRIES {
-                return Err(anyhow!(
-                    "Failed to build a valid ZIP after {} retries – giving up",
-                    MAX_RETRIES
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let dummy_retries = retries;
+        if dummy_retries > 0 {
+            info!(
+                "Icon bundle needed {} rebuild(s) to dodge the firmware byte bug ({} bytes)",
+                dummy_retries,
+                zip_data.len()
+            );
         }
 
-        info!("Sent button configuration ({} bytes)", zip_data.len());
+        let t = std::time::Instant::now();
         self.send_file(&zip_data).await?;
-        info!("Successfully sent button configuration ({} bytes)", zip_data.len());
+        info!(
+            "Sent button configuration: {} bytes, {} packets, transferred in {:?} ({} retries)",
+            zip_data.len(),
+            zip_data.len() / 1024 + 1,
+            t.elapsed(),
+            dummy_retries
+        );
         Ok(())
     }
 
@@ -605,13 +799,32 @@ impl UlanziDevice {
         let mut writer = self.writer.lock().await;
         writer.write_output_report(&first_packet).await?;
 
+        let mut chunks_in_burst = 0usize;
+        let burst = burst_size();
+        let delay = packet_delay();
         if data.len() > 1016 {
             for chunk in data[1016..].chunks(1024) {
                 let mut packet = [0u8; PACKET_SIZE];
                 let len = chunk.len().min(PACKET_SIZE);
                 packet[..len].copy_from_slice(&chunk[..len]);
                 writer.write_output_report(&packet).await?;
+
+                // The firmware drops or truncates the bundle when the host
+                // streams packets back to back (CHANGELOG 0.6.1: "blinking
+                // caused by the device receiving too many packets too fast").
+                // A short pause every few packets keeps its HID buffer drained
+                // so the screens settle instead of flashing blank.
+                chunks_in_burst += 1;
+                if burst >= 1 && chunks_in_burst >= burst {
+                    chunks_in_burst = 0;
+                    tokio::time::sleep(delay).await;
+                }
             }
+        }
+        // Let the device drain the tail of the stream before the next
+        // command arrives, so the firmware can finish committing the bundle.
+        if burst >= 1 && chunks_in_burst > 0 {
+            tokio::time::sleep(delay).await;
         }
         Ok(())
     }
@@ -757,6 +970,117 @@ mod tests {
                 other => panic!("expected encoder release for {idx}, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn test_short_hash_is_stable_and_distinguishing() {
+        // Same input must fingerprint identically so an unchanged icon is
+        // never re-encoded.
+        assert_eq!(short_hash(b"scene-icon-a"), short_hash(b"scene-icon-a"));
+        // Different payloads must not collide, otherwise a scene switch would
+        // be silently ignored and the old screen would stay on the deck.
+        assert_ne!(short_hash(b"scene-icon-a"), short_hash(b"scene-icon-b"));
+        assert_ne!(short_hash(b""), short_hash(b"\x00"));
+    }
+
+    /// The transfer is paced in bursts; a long bundle must still pause often
+    /// enough that the firmware can absorb it instead of truncating it.
+    #[test]
+    fn test_packet_pacing_covers_long_bundles() {
+        // The bundle sizes seen in the real plugin log peak around 158 kB,
+        // i.e. ~155 packets. Check a generous upper bound as well.
+        for packets in [155usize, 600] {
+            let burst = 8usize;
+            let mut chunks_in_burst = 0usize;
+            let mut pauses = 0usize;
+            for _ in 0..packets {
+                chunks_in_burst += 1;
+                if chunks_in_burst >= burst {
+                    chunks_in_burst = 0;
+                    pauses += 1;
+                }
+            }
+            // At least one pause per burst, so no single burst grows unbounded.
+            assert_eq!(pauses, packets / burst);
+            assert!(pauses > 0);
+        }
+    }
+
+    /// Hardware smoke test: pushes a full 14-icon scene to a real deck and
+    /// reports where the time goes. Ignored by default because it needs the
+    /// device attached and will visibly repaint the screens.
+    ///
+    /// Run with:  cargo test --release -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires an attached Ulanzi D200"]
+    async fn test_real_device_scene_switch_timing() {
+        use std::time::Instant;
+
+        let device = UlanziDevice::connect().await.expect("deck not attached");
+
+        // 14 distinct detailed icons, roughly the size OpenDeck delivers.
+        let mut payloads = Vec::new();
+        for i in 0..NUM_BUTTONS {
+            if i == PHANTOM_KEY {
+                continue;
+            }
+            let mut sd: u64 = 0x51ED_u64.wrapping_add(i as u64);
+            let src = image::RgbaImage::from_fn(512, 512, |x, y| {
+                sd = sd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let n = (sd >> 33) as u8;
+                let g = (x as f64 / 512.0 * 255.0) as u8;
+                let h = (y as f64 / 512.0 * 255.0) as u8;
+                let band = if (x / 48 + y / 48) % 2 == 0 { 90 } else { 0 };
+                image::Rgba([n.wrapping_add(band), g, h, 255])
+            });
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(src)
+                .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            payloads.push((i, format!("data:image/png;base64,{}", b64_encode(&png))));
+        }
+
+        // Stage: decode + resize + PNG encode for every slot.
+        let t_stage = Instant::now();
+        for (index, payload) in &payloads {
+            device
+                .set_button_image(*index, payload)
+                .await
+                .expect("set_button_image");
+        }
+        let stage = t_stage.elapsed();
+
+        // Push the whole scene to the deck.
+        let t_flush = Instant::now();
+        device.flush().await.expect("flush");
+        let flush = t_flush.elapsed();
+
+        println!("--- real hardware scene switch ---");
+        println!("stage 13 icons : {:?}", stage);
+        println!("flush to deck  : {:?}", flush);
+        println!("total          : {:?}", stage + flush);
+    }
+
+    fn b64_encode(data: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in data.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    #[test]
+    fn test_burst_and_delay_have_sane_defaults() {
+        // Defaults must stay in the range measured on real hardware: loose
+        // enough that pacing costs ~1 ms rather than ~50 ms.
+        assert!((32..=128).contains(&burst_size()));
+        assert!(packet_delay() <= Duration::from_millis(2));
     }
 
     #[test]

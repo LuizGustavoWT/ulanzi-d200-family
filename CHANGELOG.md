@@ -1,3 +1,14 @@
+# 0.8.1
+* Fixed the "tela apagada" / slow scene switches on the D200 family
+* Connecting no longer pushes an all-empty icon bundle: every key used to go black until OpenDeck pushed its first images. That blank repaint was the visible flash
+* Icon bundle retries no longer inflate the archive. Each retry used to add ~1 kB of padding, which added another checked offset and made the search diverge; large artwork could never produce a usable bundle and failed after 1000 retries, leaving the screens stale forever
+* When no byte-clean bundle can be built, the best attempt is now sent anyway instead of giving up, so the screens always update
+* Flush is only sent when an icon actually changed, and unchanged icons are no longer decoded, resized and re-encoded on every scene switch
+* Image decode/resize/encode moved off the async runtime so it no longer stalls input handling
+* Pacing between icon packets tuned against real hardware measurements (156 kB bundle), previously the defaults doubled the transfer time
+* ULANZI_BURST / ULANZI_PACKET_MS environment variables to tune the packet pacing without a rebuild
+* Added an ignored hardware test: `cargo test --release -- --ignored --nocapture`
+
 # 0.8.0
 * New "Rotary" action with a dropdown-based Property Inspector: pick a preset (volume, media, brightness, scroll) instead of typing a shell command
 * Configurable Step multiplier so one detent can move 1, 5, 10 percent or more
