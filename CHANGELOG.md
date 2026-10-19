@@ -1,3 +1,11 @@
+# Unreleased
+* macOS support: the plugin now builds and runs on macOS 11+ (Apple Silicon and Intel). Verified against real D200 hardware with OpenDeck 2.14.1 — device registration, icon transfer and key presses all work
+* Manifest declares the `mac` platform and `CodePathMac`, without which OpenDeck would never load the plugin
+* GPU load on macOS is read from the IOKit accelerator (`Device Utilization %`), covering both Apple Silicon and Intel; the Linux sysfs scan moved into its own helper
+* NVML is no longer linked on macOS, since Apple ships no NVIDIA driver support. The `nvidia` feature stays enabled by default and resolves to nothing there, via a new build.rs cfg
+* pack-local.sh installs into `~/Library/Application Support/opendeck` on macOS, with an ad-hoc codesign and quarantine strip so Gatekeeper does not kill the binary
+* Declared `rust-version = "1.95"`, the floor imposed by sysinfo 0.39
+
 # 0.8.1
 * Fixed the "tela apagada" / slow scene switches on the D200 family
 * Connecting no longer pushes an all-empty icon bundle: every key used to go black until OpenDeck pushed its first images. That blank repaint was the visible flash

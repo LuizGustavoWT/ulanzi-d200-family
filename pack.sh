@@ -81,7 +81,9 @@ fi
 # ---------- Create zip ----------
 rm -f "$ZIP_NAME"
 cd "$TMP_DIR"
-zip -r "$OLDPWD/$ZIP_NAME" "$PLUGIN_FOLDER" > /dev/null
+# -X drops the macOS resource forks / extra attributes that would otherwise
+# end up in the archive, and .DS_Store files are never part of a plugin.
+zip -r -X "$OLDPWD/$ZIP_NAME" "$PLUGIN_FOLDER" -x '*.DS_Store' > /dev/null
 cd - > /dev/null
 
 echo "Successfully created $ZIP_NAME"

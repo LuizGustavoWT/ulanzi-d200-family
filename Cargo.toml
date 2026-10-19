@@ -2,6 +2,8 @@
 name = "rs-ulanzi-d200-linux"
 version = "0.8.1"
 edition = "2024"
+# sysinfo 0.39 is the floor here; older toolchains fail at dependency resolution.
+rust-version = "1.95"
 
 [dependencies]
 async-hid = { version = "0.5.1", default-features = false, features = ["tokio"] }
@@ -25,7 +27,6 @@ sysinfo = "0.39.2"
 image = { version = "0.25.9", features = ["jpeg"] }
 data-url = "0.3"
 openaction = "2.6.0"
-nvml-wrapper = { version = "0.12.1", optional = true }
 
 [dependencies.uuid]
 version = "1.23.4"
@@ -40,3 +41,8 @@ nvidia = ["dep:nvml-wrapper"]
 
 [target.'cfg(windows)'.dependencies]
 async-hid = { version = "0.5.1", default-features = false, features = ["tokio", "win32"] }
+
+# NVML does not exist on macOS (no NVIDIA driver support), so the `nvidia`
+# feature stays enabled by default but resolves to nothing there. See build.rs.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = { version = "0.12.1", optional = true }
