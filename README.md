@@ -25,10 +25,21 @@ The D200H is identical to the D200 but includes two additional USB hubs (Genesys
 | Platform | Status |
 |----------|--------|
 | Linux    | ✅ Supported (actively developed and tested) |
+| macOS    | ✅ Supported (11 Big Sur or newer, Apple Silicon and Intel) |
 | Windows  | ❌ Planned (see roadmap) |
-| macOS    | ❌ Planned (see roadmap) |
 
 If you would like to help port the plugin to another platform, feel free to contribute!
+
+### macOS notes
+
+- No driver or udev-style setup is needed. macOS exposes the device through
+  IOHIDManager and OpenDeck can claim it directly, so `40-opendeck-ulanzi.rules`
+  and `install-udev-rules.sh` are Linux-only and can be ignored.
+- The **PC stats** screen mode reads GPU load from the IOKit accelerator, which
+  covers both Apple Silicon and Intel Macs. NVML is not compiled into the macOS
+  build, since Apple has not shipped NVIDIA driver support for years.
+- Only prebuilt releases are published for Linux today. On macOS, build and
+  install from source with `./pack-local.sh` (see below).
 
 ---
 
@@ -64,17 +75,31 @@ This action does **not** affect the button’s ability to send key presses. It o
 
 ## Building from Source
 
-Requirements: Rust, Cargo, and standard build tools (e.g., `git`, `make`).
+Requirements: Rust 1.95 or newer (`rustup update stable`), Cargo, and standard
+build tools. On macOS the Xcode Command Line Tools (`xcode-select --install`)
+provide everything else that is needed.
 
 The repository includes a `pack.sh` script that compiles the plugin and packages it as a `.zip` file.
 
 ```sh
 # Debug build (output in target/debug/)
-sh pack.sh
+sh pack.sh debug
 
 # Release build (optimized, output in target/release/)
 sh pack.sh release
 ```
+
+To build and drop the plugin straight into OpenDeck's plugin folder — the
+quickest path on macOS, and the way to iterate while developing — use
+`pack-local.sh`, which picks the right destination for the platform it runs on:
+
+```sh
+./pack-local.sh                 # auto-detect the install(s) present
+./pack-local.sh macos release   # ~/Library/Application Support/opendeck
+./pack-local.sh native debug    # ~/.config/opendeck (Linux)
+```
+
+Restart OpenDeck afterwards so it picks up the new plugin.
 
 > **Note**: The script assumes a typical Rust environment. If you encounter issues, ensure cargo is in your $PATH.
 

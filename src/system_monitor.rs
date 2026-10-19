@@ -1,13 +1,11 @@
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-use std::fs;
-use std::path::Path;
 
-#[cfg(feature = "nvidia")]
+#[cfg(nvml)]
 use nvml_wrapper::Nvml;
 
 pub struct SystemMonitor {
     sys: System,
-    #[cfg(feature = "nvidia")]
+    #[cfg(nvml)]
     nvml: Option<Nvml>,
 }
 
@@ -20,12 +18,12 @@ impl SystemMonitor {
         );
         sys.refresh_all();
 
-        #[cfg(feature = "nvidia")]
+        #[cfg(nvml)]
         let nvml = Nvml::init().ok();
 
         Self {
             sys,
-            #[cfg(feature = "nvidia")]
+            #[cfg(nvml)]
             nvml,
         }
     }
@@ -51,10 +49,11 @@ impl SystemMonitor {
     }
 
     /// Returns the utilisation percentage of the first usable GPU.
-    /// Supports NVIDIA (via NVML) and AMD/Intel (via sysfs `gpu_busy_percent`).
+    /// Supports NVIDIA (via NVML), AMD/Intel on Linux (via sysfs
+    /// `gpu_busy_percent`) and any macOS GPU (via the IOKit accelerator).
     fn get_gpu_load(&self) -> u8 {
         // 1) Try NVIDIA GPUs through NVML
-        #[cfg(feature = "nvidia")]
+        #[cfg(nvml)]
         if let Some(nv) = &self.nvml {
             if let Ok(device_count) = nv.device_count() {
                 for i in 0..device_count {
@@ -67,31 +66,69 @@ impl SystemMonitor {
             }
         }
 
-        // 2) Fallback: scan /sys/class/drm for AMD/Intel cards
-        let drm_path = Path::new("/sys/class/drm");
-        if let Ok(entries) = fs::read_dir(drm_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Only consider top‑level `cardN` entries
-                if name.starts_with("card") && name.chars().skip(4).all(|c| c.is_ascii_digit()) {
-                    // Detect vendor via PCI vendor ID
-                    let vendor_path = format!("/sys/class/drm/{}/device/vendor", name);
-                    if let Ok(vendor) = fs::read_to_string(&vendor_path) {
-                        let vendor = vendor.trim();
-                        // AMD or Intel → try gpu_busy_percent
-                        if vendor == "0x1002" || vendor == "0x8086" {
-                            let busy_path = format!("/sys/class/drm/{}/device/gpu_busy_percent", name);
-                            if let Ok(content) = fs::read_to_string(&busy_path) {
-                                if let Ok(load) = content.trim().parse::<f32>() {
-                                    return load as u8;
-                                }
-                            }
-                        }
-                    }
-                }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(load) = Self::linux_drm_gpu_load() {
+                return load;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(load) = Self::macos_ioaccelerator_gpu_load() {
+                return load;
             }
         }
 
         0
+    }
+
+    /// Scan `/sys/class/drm` for an AMD or Intel card exposing
+    /// `gpu_busy_percent`.
+    #[cfg(target_os = "linux")]
+    fn linux_drm_gpu_load() -> Option<u8> {
+        use std::fs;
+
+        for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Only consider top-level `cardN` entries
+            if !(name.starts_with("card") && name.chars().skip(4).all(|c| c.is_ascii_digit())) {
+                continue;
+            }
+            // Detect vendor via PCI vendor ID
+            let vendor = fs::read_to_string(format!("/sys/class/drm/{}/device/vendor", name)).ok()?;
+            // AMD or Intel -> try gpu_busy_percent
+            if !matches!(vendor.trim(), "0x1002" | "0x8086") {
+                continue;
+            }
+            let busy =
+                fs::read_to_string(format!("/sys/class/drm/{}/device/gpu_busy_percent", name));
+            if let Ok(load) = busy.ok()?.trim().parse::<f32>() {
+                return Some(load as u8);
+            }
+        }
+        None
+    }
+
+    /// Read `Device Utilization %` out of the IOKit accelerator's
+    /// `PerformanceStatistics` dictionary. This covers both Apple Silicon and
+    /// the discrete/integrated GPUs of Intel Macs, and needs no entitlement.
+    ///
+    /// `ioreg` is part of the base system, so shelling out avoids pulling in an
+    /// IOKit binding just for a single integer.
+    #[cfg(target_os = "macos")]
+    fn macos_ioaccelerator_gpu_load() -> Option<u8> {
+        use std::process::Command;
+
+        let out = Command::new("/usr/sbin/ioreg")
+            .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+
+        const KEY: &str = "\"Device Utilization %\"=";
+        let rest = text.split(KEY).nth(1)?;
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u8>().ok()
     }
 }
